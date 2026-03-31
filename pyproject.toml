@@ -18,7 +18,9 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
 ]
-dependencies = []
+dependencies = [
+  "numpy>=1.26",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -30,4 +32,3 @@ packages = ["src/torque_mlx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

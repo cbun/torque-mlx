@@ -18,6 +18,8 @@ This repository is organized around a decode-first implementation of rotation-na
 - Cache runtime and API surface live in `src/torque_mlx/cache.py`
 - Quantization and packing logic live in `src/torque_mlx/quantization.py`
 - Rotation helpers live in `src/torque_mlx/rotation.py`
+- Runtime layout contracts live in `src/torque_mlx/layout.py`
+- Reference attention math lives in `src/torque_mlx/reference.py`
 - Metal kernel integration metadata lives in `src/torque_mlx/kernels/`
 - Offline conversion tooling lives in `src/torque_mlx/conversion.py`
 
@@ -25,4 +27,3 @@ This repository is organized around a decode-first implementation of rotation-na
 
 - Product requirements: `PRD.md`
 - Original design proposal: `tqmlx.tex`
-
