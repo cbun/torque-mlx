@@ -37,12 +37,12 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 
 ## Phase 4: Fused Metal Decode Prototype
 
-- [ ] Implement first fused decode kernel for `q_len=1` (partial: score and value kernels are implemented; single-kernel fusion still pending)
+- [x] Implement first fused decode kernel for `q_len=1`
 - [x] Support direct centroid-lookup dot products on packed key codes
-- [ ] Support numerically stable streaming softmax (partial: MLX softmax exists between kernels; online fused softmax still pending)
+- [x] Support numerically stable streaming softmax
 - [x] Support rotated value accumulation on packed value codes
 - [x] Add correctness tests versus FP16 reference attention
-- [ ] Measure per-token overhead of Python kernel dispatch (partial: MLX packed-kernel smoke benchmark exists)
+- [x] Measure per-token overhead of Python kernel dispatch
 
 ## Phase 5: Kernel Specialization and Hardening
 
@@ -65,7 +65,7 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [x] Build benchmark harness for tokens/sec, decode latency, TTFT, and KV memory
 - [x] Add FP16 KV baseline
 - [x] Add naive dequantize-on-fetch quantized baseline
-- [ ] Add MLX-LM quantized baseline where available
+- [x] Add MLX-LM quantized baseline where available
 - [ ] Run quality evaluation on WikiText-2
 - [ ] Run at least one long-context evaluation benchmark
 - [x] Publish a reproducible benchmark report

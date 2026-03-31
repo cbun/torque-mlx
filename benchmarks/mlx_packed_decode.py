@@ -14,7 +14,11 @@ if str(SRC) not in sys.path:
 import mlx.core as mx
 import numpy as np
 
-from torque_mlx.mlx_ops import decode_packed_attention, metal_available
+from torque_mlx.mlx_ops import (
+    decode_packed_attention,
+    decode_packed_attention_split,
+    metal_available,
+)
 from torque_mlx.quantization import Codebook, pack_indices
 from torque_mlx.reference import streaming_attention_decode
 
@@ -51,12 +55,18 @@ def run_benchmark(*, seq_len: int, head_dim: int, bit_width: int, seed: int) -> 
     cent = mx.array(codebook.centroids)
 
     warmup = decode_packed_attention(q, k, v, cent, cent, bit_width=bit_width, head_dim=head_dim)
-    mx.eval(warmup)
+    warmup_split = decode_packed_attention_split(q, k, v, cent, cent, bit_width=bit_width, head_dim=head_dim)
+    mx.eval(warmup, warmup_split)
 
     started = perf_counter()
-    out = decode_packed_attention(q, k, v, cent, cent, bit_width=bit_width, head_dim=head_dim)
-    mx.eval(out)
-    packed_elapsed = perf_counter() - started
+    out_fused = decode_packed_attention(q, k, v, cent, cent, bit_width=bit_width, head_dim=head_dim)
+    mx.eval(out_fused)
+    fused_elapsed = perf_counter() - started
+
+    started = perf_counter()
+    out_split = decode_packed_attention_split(q, k, v, cent, cent, bit_width=bit_width, head_dim=head_dim)
+    mx.eval(out_split)
+    split_elapsed = perf_counter() - started
 
     started = perf_counter()
     reference = streaming_attention_decode(
@@ -70,11 +80,15 @@ def run_benchmark(*, seq_len: int, head_dim: int, bit_width: int, seed: int) -> 
         "seq_len": float(seq_len),
         "head_dim": float(head_dim),
         "bit_width": float(bit_width),
-        "mlx_packed_decode_ms": packed_elapsed * 1_000.0,
-        "mlx_packed_tokens_per_sec": 1.0 / packed_elapsed,
+        "mlx_fused_decode_ms": fused_elapsed * 1_000.0,
+        "mlx_fused_tokens_per_sec": 1.0 / fused_elapsed,
+        "mlx_split_decode_ms": split_elapsed * 1_000.0,
+        "mlx_split_tokens_per_sec": 1.0 / split_elapsed,
         "reference_decode_ms": reference_elapsed * 1_000.0,
         "reference_tokens_per_sec": 1.0 / reference_elapsed,
-        "max_abs_error": float(np.max(np.abs(np.array(out) - reference))),
+        "max_abs_error_fused": float(np.max(np.abs(np.array(out_fused) - reference))),
+        "max_abs_error_split": float(np.max(np.abs(np.array(out_split) - reference))),
+        "max_abs_diff_fused_vs_split": float(np.max(np.abs(np.array(out_fused) - np.array(out_split)))),
     }
 
 

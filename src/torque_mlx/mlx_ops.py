@@ -110,6 +110,82 @@ def _value_kernel(bit_width: int, head_dim: int) -> object:
     ), layout
 
 
+@lru_cache(maxsize=None)
+def _fused_decode_kernel(bit_width: int, head_dim: int) -> object:
+    layout = PackedKVLayout(bit_width=bit_width, head_dim=head_dim)
+    source = """
+    if (thread_position_in_grid.x != 0) {
+      return;
+    }
+
+    constexpr uint MASK = (1u << BITW) - 1u;
+    float out_local[HEAD_DIM];
+    for (uint d = 0; d < HEAD_DIM; ++d) {
+      out_local[d] = 0.0f;
+    }
+
+    float m_prev = -INFINITY;
+    float l_prev = 0.0f;
+    float scale = rsqrt((float)HEAD_DIM);
+
+    for (uint token = 0; token < SEQ_LEN; ++token) {
+      uint row_base = token * PACKED_WORDS;
+      float score = 0.0f;
+      uint bit_offset = 0u;
+
+      for (uint d = 0; d < HEAD_DIM; ++d) {
+        uint word_index = bit_offset >> 5;
+        uint shift = bit_offset & 31u;
+        uint value = k_codes[row_base + word_index] >> shift;
+        uint spill = shift + BITW;
+        if (spill > 32u) {
+          value |= k_codes[row_base + word_index + 1u] << (32u - shift);
+        }
+        uint idx = value & MASK;
+        score += query[d] * centroids_k[idx];
+        bit_offset += BITW;
+      }
+
+      score *= scale;
+      float m_new = metal::max(m_prev, score);
+      float l_scale = metal::isinf(m_prev) ? 0.0f : metal::exp(m_prev - m_new);
+      float p = metal::exp(score - m_new);
+
+      for (uint d = 0; d < HEAD_DIM; ++d) {
+        out_local[d] *= l_scale;
+      }
+
+      bit_offset = 0u;
+      for (uint d = 0; d < HEAD_DIM; ++d) {
+        uint word_index = bit_offset >> 5;
+        uint shift = bit_offset & 31u;
+        uint value = v_codes[row_base + word_index] >> shift;
+        uint spill = shift + BITW;
+        if (spill > 32u) {
+          value |= v_codes[row_base + word_index + 1u] << (32u - shift);
+        }
+        uint idx = value & MASK;
+        out_local[d] += p * centroids_v[idx];
+        bit_offset += BITW;
+      }
+
+      l_prev = l_prev * l_scale + p;
+      m_prev = m_new;
+    }
+
+    float inv_l = l_prev > 0.0f ? 1.0f / l_prev : 0.0f;
+    for (uint d = 0; d < HEAD_DIM; ++d) {
+      out[d] = out_local[d] * inv_l;
+    }
+    """
+    return mx.fast.metal_kernel(
+        name=f"torque_fused_decode_b{bit_width}_h{head_dim}",
+        input_names=["query", "k_codes", "v_codes", "centroids_k", "centroids_v"],
+        output_names=["out"],
+        source=source,
+    ), layout
+
+
 def score_packed_query(
     query: mx.array,
     packed: mx.array,
@@ -169,7 +245,7 @@ def accumulate_packed_values(
     )[0]
 
 
-def decode_packed_attention(
+def decode_packed_attention_split(
     query: mx.array,
     k_codes: mx.array,
     v_codes: mx.array,
@@ -194,3 +270,35 @@ def decode_packed_attention(
         bit_width=bit_width,
         head_dim=head_dim,
     )
+
+
+def decode_packed_attention(
+    query: mx.array,
+    k_codes: mx.array,
+    v_codes: mx.array,
+    centroids_k: mx.array,
+    centroids_v: mx.array,
+    *,
+    bit_width: int,
+    head_dim: int,
+) -> mx.array:
+    ensure_metal_toolchain()
+    kernel, layout = _fused_decode_kernel(bit_width, head_dim)
+    if k_codes.shape[-1] != layout.packed_words or v_codes.shape[-1] != layout.packed_words:
+        raise ValueError(
+            "packed width mismatch for fused decode kernel",
+        )
+    seq_len = k_codes.shape[0]
+    return kernel(
+        inputs=[query, k_codes, v_codes, centroids_k, centroids_v],
+        template=[
+            ("BITW", bit_width),
+            ("HEAD_DIM", head_dim),
+            ("PACKED_WORDS", layout.packed_words),
+            ("SEQ_LEN", seq_len),
+        ],
+        grid=(1, 1, 1),
+        threadgroup=(1, 1, 1),
+        output_shapes=[(head_dim,)],
+        output_dtypes=[mx.float32],
+    )[0]

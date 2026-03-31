@@ -2,13 +2,12 @@
 
 ## Scope
 
-This report captures the current MLX JIT Metal prototype, which consists of:
+This report captures the current MLX JIT Metal prototype, which now consists of:
 
-- a packed-code query/key score kernel
-- a packed-code value accumulation kernel
-- softmax performed in MLX between the two kernels
+- a split packed-code path with separate score and value kernels
+- a fused single-kernel decode path with in-kernel score computation, softmax, and value accumulation
 
-It is not yet the final fully fused decode kernel, but it validates that packed-code attention work can run through real Metal kernels from Python.
+The fused kernel is correctness-first and not yet optimized for throughput.
 
 ## Command
 
@@ -22,17 +21,21 @@ python benchmarks/mlx_packed_decode.py --seq-len 64 --head-dim 64 --bit-width 4
 {
   "bit_width": 4.0,
   "head_dim": 64.0,
-  "max_abs_error": 5.960464477539063e-08,
-  "mlx_packed_decode_ms": 0.474542030133307,
-  "mlx_packed_tokens_per_sec": 2107.2949001357856,
-  "reference_decode_ms": 0.4818330053240061,
-  "reference_tokens_per_sec": 2075.4078465993734,
+  "max_abs_diff_fused_vs_split": 5.960464477539063e-08,
+  "max_abs_error_fused": 3.3527612686157227e-08,
+  "max_abs_error_split": 5.960464477539063e-08,
+  "mlx_fused_decode_ms": 1.3133339816704392,
+  "mlx_fused_tokens_per_sec": 761.4209439156464,
+  "mlx_split_decode_ms": 0.47874997835606337,
+  "mlx_split_tokens_per_sec": 2088.7729403848966,
+  "reference_decode_ms": 0.526249990798533,
+  "reference_tokens_per_sec": 1900.2375629168139,
   "seq_len": 64.0
 }
 ```
 
 ## Interpretation
 
-- The MLX/Metal prototype is correct against the dequantized reference path for this synthetic case.
-- On this tiny synthetic benchmark it is roughly at parity with the reference path after warmup, which is a better starting point than the earlier ad hoc smoke measurement.
-- This is still useful progress because it proves the packed-code path is executable through MLX custom Metal kernels and can now be profiled and fused further.
+- Both the split and fused MLX/Metal paths are correct against the dequantized reference path for this synthetic case.
+- The split path is currently faster than the fused path because the fused kernel is a one-thread correctness-first implementation.
+- The important milestone is that the repo now has a real fused decode kernel to optimize, profile, and parallelize instead of only a conceptual target.
