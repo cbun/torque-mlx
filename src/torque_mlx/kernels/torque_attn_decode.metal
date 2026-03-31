@@ -1,38 +1,18 @@
-#include <metal_stdlib>
-using namespace metal;
-
-constant ushort BITW [[function_constant(0)]];
-constant ushort HEAD_DIM [[function_constant(1)]];
-constant bool FUSED_WO [[function_constant(2)]];
-
-kernel void torque_attn_decode(
-  device const half* q_rot [[buffer(0)]],
-  device const uint* k_codes [[buffer(1)]],
-  device const uint* v_codes [[buffer(2)]],
-  constant half* cent_k [[buffer(3)]],
-  constant half* cent_v [[buffer(4)]],
-  device half* out_rot [[buffer(5)]],
-  uint3 tg_pos [[threadgroup_position_in_grid]],
-  uint simd_lane [[thread_index_in_simdgroup]],
-  uint simd_gid [[simdgroup_index_in_threadgroup]]
-) {
-  // This kernel source is a checked-in prototype artifact, not a compiled path.
-  // The intended production behavior is:
-  // 1. unpack packed indices
-  // 2. compute centroid-lookup dot products for scores
-  // 3. maintain online softmax statistics
-  // 4. accumulate rotated values directly from packed codes
-  // 5. optionally hand off to fused output projection
-  (void)q_rot;
-  (void)k_codes;
-  (void)v_codes;
-  (void)cent_k;
-  (void)cent_v;
-  (void)out_rot;
-  (void)tg_pos;
-  (void)simd_lane;
-  (void)simd_gid;
-  (void)BITW;
-  (void)HEAD_DIM;
-  (void)FUSED_WO;
-}
+// Prototype kernels used by the MLX-backed packed-code path.
+//
+// These are mirrored in `src/torque_mlx/mlx_ops.py`, which JITs kernel bodies
+// through `mlx.fast.metal_kernel`. This file exists as a checked-in reference
+// for the current packed-index score and value-accumulation kernels.
+//
+// Score kernel:
+// - one thread per token
+// - unpacks BITW-sized codes from `uint32` words
+// - performs centroid-lookup dot products against the rotated query
+//
+// Value kernel:
+// - one thread per output dimension
+// - reuses the packed layout to gather centroid values
+// - accumulates a weighted sum using softmax weights produced outside the kernel
+//
+// The next production step is to fuse score computation, online softmax, and
+// value accumulation into a single decode kernel.

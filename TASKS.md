@@ -37,20 +37,20 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 
 ## Phase 4: Fused Metal Decode Prototype
 
-- [ ] Implement first fused decode kernel for `q_len=1` (blocked: full Metal toolchain unavailable)
-- [ ] Support direct centroid-lookup dot products on packed key codes (blocked: compiled kernel path unavailable)
-- [ ] Support numerically stable streaming softmax (implemented in Python reference path; Metal path blocked)
-- [ ] Support rotated value accumulation on packed value codes (implemented in Python reference path; Metal path blocked)
+- [ ] Implement first fused decode kernel for `q_len=1` (partial: score and value kernels are implemented; single-kernel fusion still pending)
+- [x] Support direct centroid-lookup dot products on packed key codes
+- [ ] Support numerically stable streaming softmax (partial: MLX softmax exists between kernels; online fused softmax still pending)
+- [x] Support rotated value accumulation on packed value codes
 - [x] Add correctness tests versus FP16 reference attention
-- [ ] Measure per-token overhead of Python kernel dispatch (blocked: no compiled MLX kernel path yet)
+- [ ] Measure per-token overhead of Python kernel dispatch (partial: MLX packed-kernel smoke benchmark exists)
 
 ## Phase 5: Kernel Specialization and Hardening
 
-- [ ] Add specialized variants for bit widths 2, 3, and 4 (partial: variant selection scaffold exists)
-- [ ] Add specialized variants for head dims 64 and 128 (partial: config + dispatch scaffold exists)
+- [x] Add specialized variants for bit widths 2, 3, and 4
+- [x] Add specialized variants for head dims 64 and 128
 - [x] Add packing-layout-aware dispatch
-- [ ] Validate register pressure and occupancy with Metal profiling (blocked: full Xcode/Metal profiling unavailable)
-- [ ] Benchmark codebook access strategies and keep the winning path (blocked: compiled kernel path unavailable)
+- [ ] Validate register pressure and occupancy with Metal profiling
+- [ ] Benchmark codebook access strategies and keep the winning path
 - [x] Decide whether the hot path must move into MLX core C++
 
 ## Phase 6: Offline Weight Fusion

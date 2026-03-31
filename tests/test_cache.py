@@ -92,3 +92,31 @@ def test_decode_matches_dequantized_reference_attention() -> None:
     )
     expected = cache.rotation.inverse(out_rot)
     np.testing.assert_allclose(output, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_decode_mlx_matches_reference_decode() -> None:
+    pytest.importorskip("mlx.core")
+    from torque_mlx.mlx_ops import metal_available
+
+    if not metal_available():
+        pytest.skip("Metal toolchain unavailable")
+
+    rng = np.random.default_rng(5)
+    cache = TorqueKVCache(
+        config=TorqueConfig(bit_width=4, head_dim=64),
+        key_codebook=_uniform_codebook(4),
+        value_codebook=_uniform_codebook(4),
+    )
+    for _ in range(6):
+        cache.append(
+            key=rng.uniform(-1.0, 1.0, size=(64,)).astype(np.float32),
+            value=rng.uniform(-1.0, 1.0, size=(64,)).astype(np.float32),
+        )
+
+    query = rng.uniform(-1.0, 1.0, size=(64,)).astype(np.float32)
+    np.testing.assert_allclose(
+        cache.decode_mlx(query=query),
+        cache.decode(query=query),
+        atol=1e-5,
+        rtol=1e-5,
+    )

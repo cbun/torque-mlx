@@ -6,6 +6,7 @@ import numpy as np
 
 from torque_mlx.config import TorqueConfig
 from torque_mlx.layout import CacheMetadata
+from torque_mlx.mlx_ops import decode_packed_attention
 from torque_mlx.quantization import (
     Codebook,
     build_gaussian_codebook,
@@ -131,6 +132,46 @@ class TorqueKVCache:
                     outputs[layer_idx, head_idx] = out_rot
                 else:
                     outputs[layer_idx, head_idx] = self.rotation.inverse(out_rot)
+
+        if self.config.num_layers == 1 and self.config.kv_heads == 1:
+            return outputs[0, 0]
+        if self.config.num_layers == 1:
+            return outputs[0]
+        return outputs
+
+    def decode_mlx(self, *, query):
+        """Run decode through the MLX JIT Metal packed-code path."""
+        import mlx.core as mx
+
+        queries = self._normalize_layer_heads(query, "query")
+        outputs = np.zeros_like(queries)
+
+        key_centroids = mx.array(self.key_codebook.centroids)
+        value_centroids = mx.array(self.value_codebook.centroids)
+
+        for layer_idx in range(self.config.num_layers):
+            for head_idx in range(self.config.kv_heads):
+                packed_keys = self._layers[layer_idx].key_codes[head_idx]
+                packed_values = self._layers[layer_idx].value_codes[head_idx]
+                if not packed_keys:
+                    continue
+
+                query_rot = self.rotation.apply(queries[layer_idx, head_idx])
+                out_rot = decode_packed_attention(
+                    mx.array(query_rot),
+                    mx.array(np.stack(packed_keys, axis=0).astype(np.uint32)),
+                    mx.array(np.stack(packed_values, axis=0).astype(np.uint32)),
+                    key_centroids,
+                    value_centroids,
+                    bit_width=self.config.bit_width,
+                    head_dim=self.config.head_dim,
+                )
+                mx.eval(out_rot)
+                out_rot_np = np.array(out_rot)
+                if self.config.fused_weights:
+                    outputs[layer_idx, head_idx] = out_rot_np
+                else:
+                    outputs[layer_idx, head_idx] = self.rotation.inverse(out_rot_np)
 
         if self.config.num_layers == 1 and self.config.kv_heads == 1:
             return outputs[0, 0]
