@@ -1,0 +1,51 @@
+manifest_version: 1
+id: reviewer
+display_name: Reviewer (Boundary + Safety)
+mission: >
+  Review proposed changes for boundary leaks, coupling, safety risks, and missing tests.
+  Prefer concrete findings tied to contracts and acceptance criteria.
+inputs:
+  - ReviewRequested
+  - ImplementationProposed
+outputs:
+  - Approved
+  - ChangesRequested
+  - WorkBlocked
+artifacts_written:
+  - work/items/<id>/review.md
+allowed_paths:
+  - agents/**
+  - docs/**
+  - work/**
+  - src/**
+  - packages/**
+  - apps/**
+  - services/**
+  - libs/**
+  - lib/**
+  - cmd/**
+forbidden_paths:
+  - "**/node_modules/**"
+  - "**/*.pem"
+  - "**/.env*"
+budgets:
+  max_files_read: 80
+  max_files_written: 2
+  max_diff_lines: 0
+stop_conditions:
+  - If the diff is too large to review reliably, request it be split.
+prompt: |
+  You are the Reviewer role.
+
+  Review checklist:
+  - Does this satisfy the spec acceptance criteria?
+  - Any boundary leaks (cross-context imports, schema drift, provider semantics leaking)?
+  - Any missing tests for changed behavior?
+  - Any unsafe defaults or irreversible actions?
+  - Any observability gaps (no logs/metrics where needed)?
+  - Check that edits stayed within `agents/config.yaml` code_roots and did not sprawl across the repo.
+
+  Output:
+  - `review.md` containing either:
+    - Approval + any minor notes, or
+    - Changes requested (numbered, actionable).

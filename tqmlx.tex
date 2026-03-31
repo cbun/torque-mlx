@@ -1,0 +1,424 @@
+\documentclass[nobib]{tufte-handout}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{graphicx}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\bfseries\color{black!70!blue},
+  commentstyle=\color{black!50},
+  frame=single,
+  breaklines=true,
+  columns=flexible,
+  xleftmargin=1em,
+  framexleftmargin=0.5em,
+  language=C,
+  morekeywords={kernel,device,constant,half,uint,uint3,ushort,float,void,for,if,return},
+}
+
+\title{torque-mlx: Rotation-Native KV-Cache\\Compression for Apple Silicon}
+\author{Design Proposal}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent \texttt{torque-mlx} is a KV-cache compression library for MLX that stores keys and values in a rotated coordinate basis and never inverts the rotation per token. Attention scoring and value accumulation happen directly on packed quantized codes via fused Metal kernels, eliminating the dequantize-on-fetch bottleneck that makes current quantized KV caches slower than FP16 on Apple hardware. The design combines three ideas---basis-native attention, offline weight fusion, and structured Hadamard rotations---into a system tuned for Metal's execution model. Target: $4\times$+ memory reduction and $2$--$4\times$ decode speedup at long contexts with no meaningful accuracy loss at ${\ge}3.5$ bits per channel.
+\end{abstract}
+
+%------------------------------------------------------------------
+\section{The Problem}
+%------------------------------------------------------------------
+
+\textbf{The KV cache is the memory wall} for long-context inference on Apple silicon. It grows linearly with sequence length, and at decode time the dominant cost is reading cached keys and values---not compute.\sidenote{Apple silicon provides 200--400\,GB/s unified memory bandwidth depending on SKU. At long contexts, KV traffic saturates this budget well before ALUs are fully utilized.}
+
+Quantizing the cache to 2--4 bits should yield proportional bandwidth savings. In practice, it doesn't: current MLX implementations that quantize KV and then dequantize on fetch run \emph{slower} than FP16 because expanding packed codes back to half-precision before the attention kernel amplifies memory traffic instead of reducing it.\sidenote{An MLX-LM issue reports roughly half of FP16 decode speed with a naive quantized cache. The problem is architectural, not algorithmic---the quantization math works, but the system design defeats it.}
+
+The fix is straightforward in principle: \textbf{never materialize decompressed KV}. Compute attention directly on packed codes inside a fused kernel. But doing this well on Metal---respecting SIMD width 32, threadgroup memory limits, occupancy constraints, and MLX's lazy evaluation model---requires a purpose-built design.
+
+
+%------------------------------------------------------------------
+\section{Core Insight: Stay Rotated}
+%------------------------------------------------------------------
+
+Rotation-based quantization works by applying an orthogonal transform $\Pi$ to each vector before scalar quantization, spreading outlier energy across coordinates so that per-element codebook quantization is more uniform.\sidenote{This principle appears across recent KV quantization work: TurboQuant uses random QR rotations, QuaRot uses randomized Hadamard transforms, RotateKV uses channel-reordered Hadamard.} The standard pipeline is: rotate $\to$ quantize $\to$ store $\to$ dequantize $\to$ inverse-rotate $\to$ attend. The inverse rotation runs \emph{per cached token, per decode step}---an $O(T \cdot d^2)$ tax that compounds the dequantization problem.
+
+\texttt{torque-mlx} eliminates this by observing that \textbf{attention is invariant under shared orthogonal transforms}:
+\[
+  q^\top k_t = (\Pi q)^\top (\Pi k_t) = q'^\top k_t'
+\]
+If queries, keys, and values all live in the rotated basis, dot-product scores are identical and value aggregation produces a rotated output $a' = \sum_t \alpha_t v_t'$ that requires at most one inverse rotation per head---not per token.\sidenote{And even that single inverse can be absorbed into the output projection weights, reducing runtime rotation cost to zero. See \S\ref{sec:weight-fusion}.}
+
+This means the entire attention computation---scoring, softmax, value accumulation---can operate on packed quantized codes in the rotated basis, with centroid lookups replacing dequantization. The kernel reads packed integers, does table lookups into a small codebook, and accumulates dot products. No intermediate FP16 KV buffer is ever materialized.
+
+
+%------------------------------------------------------------------
+\section{Design}
+%------------------------------------------------------------------
+
+The system has five components that can be adopted independently or composed.
+
+\subsection{Rotated-Basis Attention (the default path)}
+
+Store quantized $\tilde{k_t'}$ and $\tilde{v_t'}$ as packed codebook indices. During decode:\sidenote{The codebook is small ($2^b$ entries for $b$-bit quantization: 4, 8, or 16 centroids) and lives in Metal \texttt{constant} address space, effectively free to access.}
+\begin{enumerate}
+  \item Rotate the fresh query: $q' = \Pi q$
+  \item For each cached token, compute $s_t \approx q'^\top \tilde{k_t'}$ via fused centroid lookup and dot product
+  \item Run numerically stable streaming softmax
+  \item Accumulate $a' \approx \sum_t \alpha_t \tilde{v_t'}$ in the rotated basis
+  \item Apply $a = \Pi^\top a'$ (one inverse per head), or skip if weights are fused
+\end{enumerate}
+
+\paragraph{Quantization error.}
+For unit vectors and $b$-bit Lloyd-Max quantization after rotation, reconstruction MSE satisfies $\mathbb{E}\|x - \tilde{x}\|^2 \le \sqrt{3\pi/2}\,4^{-b}$.\sidenote{This is TurboQuant's MSE bound, within ${\approx}2.7\times$ of the information-theoretic optimum. The bound is pessimistic for dot-product error but gives clear bit-width scaling.} The dot-product error for a single score is bounded by Cauchy-Schwarz:
+\[
+  (q'^\top e_t)^2 \le \|q\|^2 \cdot \mathbb{E}\|e_t\|^2
+\]
+since $\Pi$ preserves norms. At ${\ge}3.5$ bits, end-to-end quality is empirically neutral.
+
+
+\subsection{Weight Fusion: Zero Runtime Rotation}\label{sec:weight-fusion}
+
+Modify model weights offline so the network natively produces and consumes rotated representations:\sidenote{This is a one-time offline conversion. The modified model is mathematically identical to the original in exact arithmetic---no retraining or calibration needed.}
+\begin{align*}
+  W_Q' &= \Pi W_Q, & W_K' &= \Pi W_K, & W_V' &= \Pi W_V, & W_O' &= W_O \Pi^\top.
+\end{align*}
+
+The attention block output is unchanged:
+\[
+  o = W_O\,a = W_O\,\Pi^\top a' = W_O'\,a'
+\]
+
+Runtime rotation cost becomes zero. The only approximation is in quantized KV.\sidenote{This also reduces numerical risk: no rotation operations are applied in reduced precision at inference time. Interacts with weight quantization pipelines (GPTQ, AWQ)---the rotation should be fused \emph{before} weight quantization.}
+
+
+\subsection{Structured Rotations: Hadamard over QR}
+
+Dense random rotations cost $O(d^2)$ per vector. \texttt{torque-mlx} uses structured orthogonal transforms instead:
+\[
+  \Pi = D_1 H D_2
+\]
+where $H$ is a Walsh-Hadamard matrix and $D_i$ are random diagonal sign matrices.\sidenote{$O(d \log d)$ additions vs.\ $O(d^2)$ multiply-adds. For block-Hadamard with block size $B$: $O(d \log B)$, trading mixing strength for register locality.}
+
+\marginnote{Head dimensions 64 and 128 are powers of two---directly compatible with standard Hadamard implementations. Hadamard butterflies map naturally to SIMD-group operations on Apple GPUs where the execution width is 32.}
+
+The theoretical worst-case bound for Haar-random rotations doesn't transfer exactly to structured $\Pi$, but empirically, Hadamard-based rotations match or exceed random QR for outlier suppression.\sidenote{QuaRot reports small perplexity changes on WikiText-2 with Hadamard at 4-bit. RotateKV adds outlier-aware channel reordering for sub-3-bit regimes.} The Lloyd-Max codebook can be optionally refined for the structured distribution via offline Monte Carlo---still data-oblivious with respect to model activations.
+
+
+\subsection{Residual Bias Correction (for $\le 3$-bit regimes)}
+
+At very low bit widths, scalar quantization introduces systematic bias in inner-product estimates. A correction mechanism stores a 1-bit sketch of the quantization residual $r = k' - \tilde{k'}$ using a structured Hadamard projection:\sidenote{This adds ${\sim}1$ bit per coordinate but eliminates bias. The fused kernel computes the correction term without ever reconstructing the residual vector---it's an additional dot-product pass over sign bits.}
+\begin{itemize}
+  \item Randomized Hadamard projection of the residual
+  \item Store only sign bits
+  \item Fused correction inside the attention kernel
+\end{itemize}
+
+This is most relevant at 2--2.5 bits, where uncorrected MSE quantizers can cause attention logit drift.
+
+
+\subsection{Cold-Cache Tiering (for very long contexts)}
+
+KV access has temporal locality: recent tokens are read every step, old tokens are read but infrequently updated. For contexts long enough that even quantized KV strains memory:\sidenote{Entropy coding of codebook indices can further reduce average bit-width below the fixed-rate packing. This is most attractive for ``cold'' pages where decompression latency is amortized over many decode steps.}
+\begin{itemize}
+  \item Recent KV stays in fast packed-index format
+  \item Older KV moves to entropy-coded streams ($<2$-bit average)
+  \item Block decompression into the ``warm'' quantized format on demand
+\end{itemize}
+
+\marginnote[-0.5cm]{On unified memory, CPU decompression into a GPU-friendly layout is viable without a copy. This resembles KV paging applied to compressed bitstreams rather than FP16 buffers.}
+
+
+\subsection{Design Summary}
+
+\smallskip
+\begin{fullwidth}
+\small
+\begin{tabular}{@{}lccccl@{}}
+\toprule
+\textbf{Component} & \textbf{Runtime rot.} & \textbf{Per-token $\Pi^{-1}$} & \textbf{KV bits} & \textbf{Kernel complexity} & \textbf{When to use} \\
+\midrule
+Rotated-basis attn.   & Q only     & No & 2--4\,b & Medium & Default path \\
+Weight fusion          & None       & No & Same    & Med--high (offline) & Dedicated deployment \\
+Hadamard $\Pi$         & Fast       & No & Same    & Medium & Always (replaces dense QR) \\
+Residual correction    & ---        & No & $+1$\,b sketch & High & Ultra-low-bit (${\le}3$\,b) \\
+Cold tiering           & N/A        & N/A & ${<}2$\,b avg & High & Very long contexts \\
+\bottomrule
+\end{tabular}
+\end{fullwidth}
+
+
+%------------------------------------------------------------------
+\section{Metal Kernel Design}
+%------------------------------------------------------------------
+
+The fused decode kernel is the critical path. Everything else---quantization, packing, weight conversion---is either offline or amortized over many decode steps.\sidenote{MLX experience confirms: bandwidth amplification from intermediate materialization erases all quantization wins. The kernel must consume packed codes directly.}
+
+\subsection{Data Layout}
+
+\paragraph{Packed rotated KV.}
+For each (layer, head, token), a packed array of codebook indices over \texttt{head\_dim} in the rotated basis:\sidenote{This layout streams naturally over tokens. The kernel processes tokens in blocks for cache locality.}
+
+\texttt{K\_codes}, \texttt{V\_codes}: \texttt{[layers, kv\_heads, seq\_len, packed\_words]}
+
+\paragraph{Bit packing.}
+\marginnote{%
+\textbf{2-bit:} 16 indices per \texttt{uint32}.\\
+\textbf{4-bit:} 8 indices per \texttt{uint32}.\\
+\textbf{3-bit:} 32 indices into $3\times$\texttt{uint32} (96 bits) for SIMD alignment.\\[6pt]
+\textbf{Non-integer widths} (2.5, 3.5\,b) via outlier-channel split: $|O|$ outlier dimensions at $b_{\mathrm{hi}}$ bits, remainder at $b_{\mathrm{lo}}$. A dimension permutation groups outliers contiguously for efficient packing.
+}
+
+\paragraph{Codebook.}
+$2^b \in \{4,8,16\}$ centroids in \texttt{constant} address space---effectively register-speed on Apple GPUs.
+
+
+\subsection{Kernel Architecture}
+
+Two families: decode (batch 1, bandwidth-bound) and prefill (large batch, compute-bound).\sidenote{A single kernel path is suboptimal for both regimes. Prefill can benefit from dequantizing a tile into registers and using a GEMM-like path.}
+
+\marginnote{%
+\textbf{Metal execution model:}\\[4pt]
+SIMD width: 32 on Apple GPUs.\\
+Threadgroup: multiples of 32, up to 1024 threads, up to 32\,KB shared memory.\\[4pt]
+Each SIMD group handles one attention head. Threadgroup shape: \texttt{(32, heads\_per\_tg)}.\\[4pt]
+Minimize register pressure. Avoid large threadgroup staging unless it measurably reduces device memory bandwidth.
+}
+
+The decode kernel (\texttt{torque\_attn\_decode}) fuses four operations into a single pass over the KV cache:
+\begin{enumerate}
+  \item Centroid-lookup dot products: $s_t = q'^\top \tilde{k_t'}$
+  \item Numerically stable streaming softmax
+  \item Rotated value accumulation: $a' = \sum_t \alpha_t \tilde{v_t'}$
+  \item Optional post-rotation or fused output projection
+\end{enumerate}
+
+
+\subsection{Kernel Pseudocode}
+
+\begin{fullwidth}
+\begin{lstlisting}
+// torque_attn_decode: fused decode attention, q_len=1
+// Operates directly on packed quantized KV codes.
+// Specialized at compile time via function constants.
+
+constant ushort BITW [[function_constant(0)]];       // 2, 3, 4
+constant ushort HEAD_DIM [[function_constant(1)]];    // 64, 128
+constant ushort PACK_MODE [[function_constant(2)]];   // packing layout
+constant bool   FUSED_WO [[function_constant(3)]];    // weight-fused mode
+
+kernel void torque_attn_decode(
+  device const half*  q_rot   [[buffer(0)]],
+  device const uint*  k_codes [[buffer(1)]],
+  device const uint*  v_codes [[buffer(2)]],
+  constant half*      centK   [[buffer(3)]],
+  constant half*      centV   [[buffer(4)]],
+  device half*        out_rot [[buffer(5)]],
+  uint3 tg_pos    [[threadgroup_position_in_grid]],
+  uint  simd_lane [[thread_index_in_simdgroup]],
+  uint  simd_gid  [[simdgroup_index_in_threadgroup]]
+) {
+  uint head = tg_pos.x * HEADS_PER_TG + simd_gid;
+
+  // Each lane handles dims: lane, lane+32, lane+64, ...
+  half q_local[HEAD_DIM_PER_LANE];
+  for (uint m = 0; m < HEAD_DIM_PER_LANE; ++m)
+    q_local[m] = q_rot[head * HEAD_DIM + simd_lane + 32*m];
+
+  float m_prev = -INFINITY, l_prev = 0.0f;
+  float out_local[HEAD_DIM_PER_LANE] = {0};
+
+  for (uint t0 = 0; t0 < SEQ_LEN; t0 += TOKENS_PER_BLOCK) {
+    float score_block[TOKENS_PER_BLOCK];
+
+    // 1) Fused centroid lookup + dot product
+    for (uint dt = 0; dt < TOKENS_PER_BLOCK; ++dt) {
+      float partial = 0.0f;
+      ushort idxs[HEAD_DIM_PER_LANE] =
+        unpack_indices(k_codes, head, t0+dt, simd_lane);
+      for (uint m = 0; m < HEAD_DIM_PER_LANE; ++m)
+        partial += float(q_local[m]) * float(centK[idxs[m]]);
+      float s = simd_sum(partial);
+      if (simd_lane == 0) score_block[dt] = s * INV_SQRT_D;
+    }
+    // Broadcast scores via simd shuffle...
+
+    // 2) Streaming softmax (online, numerically stable)
+    float m_block = max_over(score_block);
+    float m_new = max(m_prev, m_block);
+    float l_scale = exp(m_prev - m_new);
+    float l_block = 0.0f;
+    float p_block[TOKENS_PER_BLOCK];
+    for (uint dt = 0; dt < TOKENS_PER_BLOCK; ++dt) {
+      p_block[dt] = exp(score_block[dt] - m_new);
+      l_block += p_block[dt];
+    }
+    float l_new = l_prev * l_scale + l_block;
+
+    // 3) Rescale accumulator + weighted value sum
+    for (uint m = 0; m < HEAD_DIM_PER_LANE; ++m)
+      out_local[m] *= l_scale;
+    for (uint dt = 0; dt < TOKENS_PER_BLOCK; ++dt) {
+      ushort vidxs[HEAD_DIM_PER_LANE] =
+        unpack_indices(v_codes, head, t0+dt, simd_lane);
+      for (uint m = 0; m < HEAD_DIM_PER_LANE; ++m)
+        out_local[m] += p_block[dt] * float(centV[vidxs[m]]);
+    }
+    m_prev = m_new; l_prev = l_new;
+  }
+
+  // Normalize and write output
+  float inv_l = 1.0f / l_prev;
+  for (uint m = 0; m < HEAD_DIM_PER_LANE; ++m)
+    out_rot[head*HEAD_DIM + simd_lane + 32*m] =
+      half(out_local[m] * inv_l);
+}
+\end{lstlisting}
+\end{fullwidth}
+
+
+\subsection{Specialization Strategy}
+
+Metal function constants (\texttt{[[function\_constant]]}) let the compiler generate a separate optimized binary for each configuration:\sidenote{This eliminates runtime branches and unnecessary loads. Each (bit width, head dim, packing layout, outlier split, fusion mode) tuple becomes a distinct kernel variant---the cost is compile time, not runtime.}
+\begin{itemize}
+  \item Bit width $b \in \{2, 3, 4\}$
+  \item Head dimension $\in \{64, 128\}$
+  \item Packing layout and outlier split parameters
+  \item Weight-fused mode (skip post-rotation)
+\end{itemize}
+
+
+%------------------------------------------------------------------
+\section{MLX Integration}
+%------------------------------------------------------------------
+
+\marginnote{%
+\textbf{Implementation plan:}\\[4pt]
+1.~\texttt{TorqueKVCache} class storing packed \texttt{k\_codes}, \texttt{v\_codes}, codebooks, and optional per-layer $\Pi$.\\[4pt]
+2.~Drop-in replacement for MLX-LM's attention module: the cache class dispatches to fused Metal kernels during decode.\\[4pt]
+3.~Respect MLX's lazy evaluation model---avoid forcing materialization.\\[4pt]
+4.~Exploit unified memory for offline weight conversion and codebook preparation on CPU.\\[4pt]
+5.~Prototype via \texttt{mlx.core.fast.metal\_kernel}; production path via C++ MLX core with precompiled Metal libraries.
+}
+
+The critical integration point is replacing dequantize-on-fetch with the fused kernel. The \texttt{TorqueKVCache} must present the same interface as MLX-LM's existing cache classes so that model code requires minimal changes---ideally just swapping the cache constructor.\sidenote{If Python-level custom kernel overhead is too high for per-layer per-token decode, the design migrates to MLX core C++ with precompiled Metal libraries and function-constant specialization.}
+
+
+%------------------------------------------------------------------
+\section{Expected Performance}
+%------------------------------------------------------------------
+
+\subsection{Memory Reduction}
+
+At 3.5 bits per element, payload is $3.5/16 = 0.22\times$ FP16---a $4.57\times$ reduction. At 2.5 bits, $6.4\times$. With cold-tier entropy coding, further reduction is possible for old cache pages.
+
+\subsection{Decode Speedup}
+
+The first-order bound for bandwidth-dominated decode:
+\[
+  S_{\max} \approx \frac{\mathrm{bytes}_{\mathrm{FP16}}}{\mathrm{bytes}_{\mathrm{quant}}}
+\]
+
+\marginnote{%
+\textbf{Payload-only speedup bounds:}\\[4pt]
+8-bit: $2.0\times$\\
+4-bit: $4.0\times$\\
+3.5-bit: $4.57\times$\\
+3-bit: $5.33\times$\\
+2.5-bit: $6.4\times$\\[6pt]
+Real speedups will be lower due to softmax, non-KV layers, and kernel overhead. Target: close to these bounds by fusing decode attention and avoiding extra passes.
+}
+
+\subsection{Accuracy}
+
+Quality-neutral behavior at ${\ge}3.5$ bits per channel. Bounded degradation at 2.5 bits with residual correction. These targets are grounded in published results across multiple rotation-based quantization methods.\sidenote{TurboQuant reports LongBench parity at 3.5-bit. QuaRot reports small perplexity changes at 4-bit on WikiText-2. RotateKV maintains quality at 2--3 bits with outlier-aware rotation.}
+
+
+%------------------------------------------------------------------
+\section{Evaluation Plan}
+%------------------------------------------------------------------
+
+\subsection{Metrics}
+
+\begin{itemize}
+  \item \textbf{Throughput:} tokens/s at batch 1 and moderate batch sizes, across context lengths
+  \item \textbf{Latency:} per-token decode and time-to-first-token (TTFT)
+  \item \textbf{Memory:} peak unified memory attributed to KV cache; bytes per cached token
+  \item \textbf{Accuracy:} WikiText-2 perplexity, LongBench scores, top-1 token agreement vs.\ FP16
+\end{itemize}
+
+\subsection{Baselines}
+
+\begin{enumerate}
+  \item FP16 KV cache (the floor for speed, ceiling for quality)
+  \item MLX-LM \texttt{QuantizedKVCache} (affine 4/8-bit)\sidenote{Existing MLX quantized cache with optimized matmul support.}
+  \item Naive quantized cache with dequantize-on-fetch (the current ``slow'' path)
+  \item KIVI and RotateKV where implementations exist
+\end{enumerate}
+
+\subsection{Ablations}
+
+\marginnote{%
+\textbf{Algorithmic:}\\[4pt]
+No rotation vs.\ dense $\Pi$ vs.\ Hadamard $\Pi$.\\
+MSE-only vs.\ residual-corrected.\\
+Outlier split on/off; sensitivity to $|O|$.\\
+Post-RoPE vs.\ pre-RoPE rotation placement.\\[8pt]
+\textbf{Kernel:}\\[4pt]
+Fused decode vs.\ dequantize-on-fetch.\\
+Packing schemes for 3-bit and mixed-bit.\\
+Constant vs.\ threadgroup-staged codebooks.\\
+Heads-per-threadgroup: 1, 2, 4.
+}
+
+
+%------------------------------------------------------------------
+\section{Risks}
+%------------------------------------------------------------------
+
+\paragraph{RoPE interaction.}
+Where rotation is applied relative to positional embedding matters. Naive placement degrades quality at low bits.\sidenote{RotateKV introduces explicit Pre-RoPE and RoPE-aware steps. \texttt{torque-mlx} must handle this correctly per-model.}
+
+\paragraph{Occupancy collapse.}
+Aggressive unrolling or large per-thread accumulators can throttle Metal occupancy.\sidenote{Register usage and threadgroup memory both bound occupancy. The kernel design must keep footprints bounded, validated via Metal GPU profiling.}
+
+\paragraph{New metadata overhead.}
+Codebook lookups and bit-unpacking replace scale/bias reads but can become the new bottleneck if the unpacking logic touches too much memory.\sidenote{MLX quantized matmul regressions show that even small per-group metadata increases harm throughput. \texttt{torque-mlx}'s advantage is that codebooks are global (not per-group), fitting in constant memory.}
+
+\paragraph{MLX graph integration.}
+Inserting a high-frequency custom kernel into MLX's lazy evaluation graph without forcing materialization or increasing overhead requires careful stream management.
+
+\paragraph{Structured rotation gap.}
+Hadamard $\Pi$ lacks the exact worst-case guarantees of Haar-random rotation. In practice this hasn't mattered above 3 bits, but sub-2-bit regimes may expose it.\sidenote{Mitigation: offline codebook refinement for the structured distribution, and residual correction for the lowest bit widths.}
+
+
+%------------------------------------------------------------------
+\section{Deliverables}
+%------------------------------------------------------------------
+
+\begin{enumerate}
+  \item \textbf{\texttt{torque-mlx} Python package} with \texttt{TorqueKVCache} drop-in for MLX-LM
+  \item \textbf{Metal kernel library} with function-constant specializations: bit widths $\{2,3,4\}$, head dims $\{64,128\}$, outlier splits, fusion modes
+  \item \textbf{Offline conversion tool}: fuse $\Pi$ into model weights, prepare codebooks
+  \item \textbf{Benchmark suite}: decode throughput, TTFT, peak memory, perplexity across bit widths and context lengths
+\end{enumerate}
+
+\subsection{Acceptance Criteria}
+
+\begin{itemize}
+  \item Quality-neutral at ${\ge}3.5$ bits: LLM end-to-end tasks indistinguishable from FP16 KV cache\sidenote{The bar is parity with published rotation-based quantization results, not merely ``acceptable degradation.''}
+  \item Decode faster than FP16 at long contexts (eliminating the current regression)
+  \item Stable occupancy and SIMD utilization across Apple silicon SKUs
+\end{itemize}
+
+
+\end{document}

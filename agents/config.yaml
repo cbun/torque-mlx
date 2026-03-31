@@ -1,0 +1,34 @@
+# Project-Specific Harness Config
+#
+# This file is the only part of the harness that should be customized per project.
+# Everything else under `agents/` should remain reusable across repos.
+#
+# Recommended: keep this file small. Prefer updating docs/contracts in-repo over adding
+# more “magic” settings.
+
+project_name: "torque-mlx"
+
+# Where product code typically lives. Update to match your repo layout.
+code_roots:
+  - "src"
+
+# Documentation roots (repo map, ADRs, contracts summaries).
+docs_roots:
+  - "docs"
+
+# Where contract-like artifacts usually live. These are globs, not strict rules.
+contract_globs:
+  - "**/contracts/**"
+  - "**/schemas/**"
+  - "**/proto/**"
+  - "**/openapi/**"
+  - "**/api/**"
+
+# Proof commands (what “green” means). Fill these in once the repo has tooling.
+# Examples:
+#   - "npm test"
+#   - "pnpm -w test"
+#   - "pytest"
+#   - "go test ./..."
+proof_commands:
+  - "pytest"
