@@ -2,49 +2,74 @@
 
 `torque-mlx` is a model conversion and KV-cache optimization toolkit for MLX on Apple silicon.
 
-It is built for the failure mode that makes many quantized KV caches disappointing in practice: they save bits at rest, then give the bandwidth back by dequantizing cached keys and values into dense FP16 buffers during decode. `torque-mlx` avoids that path entirely. Keys and values are stored as packed quantized codes in a rotated basis, and decode attention runs directly on those packed codes inside fused Metal kernels.
+The project is built around one core idea: KV-cache quantization only helps if decode attention operates directly on packed cached values instead of expanding them back into dense FP16 buffers. `torque-mlx` stores keys and values as packed quantized codes in a rotated basis and targets fused packed-code decode kernels for long-context inference.
 
-This repository contains original `torque-mlx` code and design documents, but it is intentionally built for the Apple MLX ecosystem and interoperates with upstream model families such as Qwen through curated conversion workflows. That means the README should distinguish between:
+## What It Does Today
 
-- original project code and docs in this repository
-- upstream runtimes and model ecosystems this project targets
-- related research that informed the design
+The repo currently provides:
 
-The product direction is not just “a cache class.” The goal is an end-to-end workflow:
+- rotation, quantization, packing, and reference decode primitives
+- a `TorqueKVCache` runtime for packed rotated KV decode
+- offline attention-weight fusion
+- a versioned artifact format for converted attention blocks
+- a packaged CLI for conversion, inspection, benchmarking, and evaluation
+- a curated Qwen workflow for planning and rewriting local Hugging Face snapshots
 
-- convert supported models into torque-aware artifacts
-- load those artifacts with a matching runtime profile
-- run long-context decode through fused packed-code kernels
-- benchmark and evaluate the result against baseline MLX paths
+This is still pre-alpha infrastructure. It is useful for experiments, conversion workflows, and validation, but it is not yet a polished end-user MLX deployment stack.
 
-The result is a deployment-oriented toolkit designed to make quantization pay off where it matters most on Apple hardware: long-context decode, where unified-memory bandwidth becomes the bottleneck.
+## Current Support Model
 
-## Current Status
+Support is curated, not universal.
 
-The repository is still pre-alpha, but it now has the beginnings of the intended product surface:
+- Families are added explicitly.
+- Unsupported architectures should fail clearly.
+- Converted artifacts should be validated before being published.
 
-- a versioned converted-model artifact format
-- a `torque-mlx` CLI with `convert`, `benchmark`, `eval`, and `inspect`
-- a runtime cache implementation for packed rotated KV decode
-- offline attention-weight fusion utilities
+At the moment, the strongest family-specific path is Qwen:
 
-Today, the converter targets generic attention checkpoints stored as `.npz` files with `w_q`, `w_k`, `w_v`, and `w_o` arrays. That is a foundation for future MLX/Hugging Face model-specific adapters, not the final UX.
+- inspect a local snapshot with `torque-mlx plan qwen`
+- rewrite supported `full_attention` layers with `torque-mlx convert-qwen-model`
+- inspect the converted manifest with `torque-mlx inspect-qwen-model`
 
-The intended support model is curated, not universal:
+## Requirements
 
-- explicit family workflows for models you have actually inspected
-- explicit failure on unsupported architectures or unsupported head dimensions
-- publish validated converted artifacts, not blanket compatibility claims
+For conversion workflows:
 
-## Intended Workflow
+- Apple Silicon Mac is the intended platform
+- Python `>= 3.11`
+- `numpy`
+- `safetensors`
 
-The intended user flow is:
+For MLX runtime and packed-kernel benchmarks:
 
-1. Convert a supported checkpoint into a torque artifact.
-2. Load the artifact and use its runtime profile for decode.
-3. Benchmark and evaluate the artifact against baseline MLX paths.
+- Apple Silicon
+- `mlx`
+- Xcode / Metal toolchain available to MLX
 
-Example:
+The current runtime envelope supports:
+
+- head dimensions: `64`, `128`, `256`
+- bit widths: `2`, `3`, `4`
+- structured Hadamard rotation
+- batch-1 decode oriented flows
+
+## Install
+
+From the repo root:
+
+```bash
+pip install -e .
+```
+
+For tests:
+
+```bash
+pip install -e .[dev]
+```
+
+## Quick Start
+
+Convert a generic attention checkpoint:
 
 ```bash
 torque-mlx convert \
@@ -54,13 +79,25 @@ torque-mlx convert \
   --bit-width 4
 
 torque-mlx inspect --artifact ./artifacts/tiny-attention
+```
 
-torque-mlx benchmark synthetic --seq-len 512 --head-dim 128 --kv-heads 8 --bit-width 4
+Run the reference benchmark:
 
+```bash
+torque-mlx benchmark synthetic \
+  --seq-len 512 \
+  --head-dim 128 \
+  --kv-heads 8 \
+  --bit-width 4
+```
+
+Evaluate an artifact:
+
+```bash
 torque-mlx eval --artifact ./artifacts/tiny-attention --seq-len 512
 ```
 
-You can also load the artifact programmatically:
+Programmatic use:
 
 ```python
 from torque_mlx import load_torque_artifact
@@ -69,228 +106,99 @@ artifact = load_torque_artifact("./artifacts/tiny-attention")
 cache = artifact.build_cache()
 ```
 
-## Why It Exists
+## Qwen Workflow
 
-On Apple silicon, long-context inference is often limited by KV-cache reads rather than raw compute. The KV cache grows linearly with sequence length, and every decode step rereads prior keys and values. In that regime:
+Inspect a local Qwen snapshot:
 
-- FP16 KV caches consume too much bandwidth and memory.
-- Naive quantized KV caches often regress on speed because they dequantize on fetch.
-- Apple GPU performance depends heavily on data layout, SIMD-group shape, register pressure, and avoiding extra passes through memory.
+```bash
+torque-mlx plan qwen --model-dir /path/to/qwen-snapshot
+```
 
-`torque-mlx` is designed around that systems constraint rather than treating KV quantization as only a math problem.
+Convert a full local Qwen snapshot:
 
-## Core Idea
+```bash
+torque-mlx convert-qwen-model \
+  --model-dir /path/to/qwen-snapshot \
+  --output-dir ./artifacts/qwen-torque \
+  --model-name qwen-torque
+```
 
-The project uses a shared orthogonal rotation to move queries, keys, and values into a basis that is easier to quantize. Attention is invariant under that shared rotation:
+Inspect the converted Qwen manifest:
 
-`q^T k = (Pi q)^T (Pi k)`
+```bash
+torque-mlx inspect-qwen-model --artifact ./artifacts/qwen-torque
+```
 
-That means attention scoring and value accumulation can happen directly in the rotated basis:
+The current Qwen converter:
 
-- rotate the fresh query once
-- keep cached keys and values packed in rotated coordinates
-- compute dot products from packed indices via centroid lookup
-- run streaming softmax
-- accumulate rotated values
-- optionally avoid even the final inverse rotation by fusing it into the output projection offline
+- reads a local Hugging Face-style `safetensors` snapshot
+- identifies `full_attention` layers from `config.json`
+- rewrites only supported `q/k/v/o` attention projection weights
+- copies non-converted tensors through unchanged
+- emits `torque_qwen_manifest.json` in the output snapshot
 
-The system never needs to reconstruct the cached KV tensors as dense FP16 arrays during decode.
+It assumes standard Qwen-style tensor suffixes and should be treated as a curated family workflow, not a generic HF converter.
 
-## Design Overview
+## How It Works
 
-`torque-mlx` combines three main ideas:
+`torque-mlx` combines three ideas:
 
-- Basis-native attention: attention operates directly on packed quantized KV codes in rotated space.
-- Offline weight fusion: the shared rotation can be absorbed into `W_Q`, `W_K`, `W_V`, and `W_O` so runtime rotation cost goes to zero.
-- Structured rotations: Walsh-Hadamard-based transforms replace dense random rotations so the method maps cleanly to Apple GPU execution.
+- Basis-native attention: decode runs directly on packed quantized KV codes in rotated space.
+- Offline weight fusion: the shared rotation can be fused into `W_Q`, `W_K`, `W_V`, and `W_O`.
+- Structured rotations: Hadamard-based transforms keep the method compatible with Apple GPU-friendly execution patterns.
 
-In product terms, those become:
+The intended hot path is:
 
-- offline conversion into a torque-aware artifact
-- runtime execution through a torque-aware KV cache
-- proof via benchmark and evaluation commands
+1. Rotate the fresh query.
+2. Read packed cached keys and values.
+3. Compute attention scores from centroid lookups.
+4. Run numerically stable streaming softmax.
+5. Accumulate rotated values.
+6. Optionally avoid inverse rotation with fused output weights.
 
-## Architecture
+## Scope and Limits
 
-The project is organized around a small number of product-critical components:
+The repo is focused on decoder-only transformer inference through MLX on Apple silicon.
 
-- converted model artifacts: versioned bundles that carry fused weights and runtime metadata
-- `TorqueKVCache`: drop-in KV-cache implementation for MLX/MLX-LM-style decode flows
-- fused Metal decode kernels: the hot path for `q_len = 1` decode
-- quantization and packing logic: turns rotated KV tensors into packed code streams
-- rotation and conversion tooling: supports structured rotations and offline weight fusion
-- benchmark/eval harness: validates throughput, latency, memory, and quality against FP16 and other baselines
+In scope now:
 
-## CLI
+- packed rotated KV cache primitives
+- offline fusion tooling
+- generic attention artifacts
+- curated Qwen snapshot rewriting
+- synthetic and MLX benchmark harnesses
 
-The repository now exposes a packaged CLI:
+Not in scope yet:
 
-- `torque-mlx convert`: fuse attention weights from an `.npz` checkpoint and emit a versioned artifact
-- `torque-mlx inspect`: print artifact metadata, runtime config, and weight shapes
-- `torque-mlx plan qwen`: inspect a local Qwen snapshot and emit a curated conversion plan
-- `torque-mlx convert-qwen-layer`: convert one extracted Qwen `full_attention` layer into an artifact
-- `torque-mlx convert-qwen-model`: rewrite a local Qwen HF snapshot with fused `full_attention` weights and emit a model manifest
-- `torque-mlx inspect-qwen-model`: inspect a converted Qwen model manifest
-- `torque-mlx benchmark synthetic`: run the reference decode benchmark
-- `torque-mlx benchmark mlx-packed`: run the MLX packed-kernel benchmark
-- `torque-mlx benchmark mlx-lm`: compare against MLX-LM FP16 and quantized cache baselines
-- `torque-mlx eval`: run artifact-level evaluation using the synthetic decode harness
+- universal model-family conversion
+- production-ready MLX loader integration for every converted model
+- arbitrary head dimensions
+- non-Apple backends
 
-The on-disk artifact contract is defined in [docs/contracts/model-artifact.md](./docs/contracts/model-artifact.md).
-Curated family workflows are documented under [docs/families](./docs/families/qwen.md).
+## Repository Guide
 
-## Decode Path
-
-The critical runtime path is fused decode attention. A single kernel pass over the cache performs:
-
-1. packed-index unpacking and centroid-lookup dot products for attention logits
-2. numerically stable streaming softmax
-3. weighted rotated-value accumulation
-4. output writeback in rotated space, or direct consumption by a fused output projection
-
-This is the product’s defining optimization. If decode materializes intermediate dense KV, the design has failed.
-
-## Data Representation
-
-The cache stores rotated keys and values as packed codebook indices rather than floating-point tensors.
-
-Canonical runtime layout:
-
-- `K_codes`: `[layers, kv_heads, seq_len, packed_words]`
-- `V_codes`: `[layers, kv_heads, seq_len, packed_words]`
-
-Initial packing targets:
-
-- 2-bit: 16 indices per `uint32`
-- 3-bit: aligned multiword packing for SIMD-friendly decode
-- 4-bit: 8 indices per `uint32`
-
-The small centroid tables used for lookup are intended to live in Metal constant memory so codebook access is effectively free relative to cache traffic.
-
-## Rotation Strategy
-
-`torque-mlx` uses structured Hadamard-based rotations instead of dense QR-style random rotations.
-
-Why:
-
-- head dimensions `64`, `128`, and `256` are natural fits for Hadamard structure
-- the cost drops from dense `O(d^2)` work to structured `O(d log d)` work
-- butterfly-style transforms map well to Apple GPU SIMD groups
-- the method preserves the outlier-suppression benefits needed for low-bit scalar quantization
-
-The default design is a sign-flipped Hadamard family of the form `Pi = D1 H D2`.
-
-## Weight Fusion
-
-For deployments that want zero runtime rotation overhead, `torque-mlx` supports offline fusion of the shared rotation into the attention weights:
-
-- `W_Q' = Pi W_Q`
-- `W_K' = Pi W_K`
-- `W_V' = Pi W_V`
-- `W_O' = W_O Pi^T`
-
-After fusion, the model natively produces and consumes rotated representations, and the only approximation left in the attention block is KV quantization itself.
-
-The current converter writes those fused attention weights into a versioned artifact directory so runtime configuration, codebooks, and fused weights stay in sync.
-
-## Metal Execution Model
-
-The kernels are designed around Apple GPU constraints rather than treating Metal as a thin backend:
-
-- SIMD width `32`
-- threadgroup sizing in multiples of `32`
-- careful control of register pressure
-- minimal threadgroup-memory staging unless it clearly reduces bandwidth
-- compile-time specialization for hot-path variants
-
-Kernel specialization is expected across:
-
-- bit width: `2`, `3`, `4`
-- head dimension: `64`, `128`, `256`
-- packing mode
-- fused-weight vs non-fused mode
-
-## Quality and Performance Targets
-
-Design targets for the system are:
-
-- `4x+` KV memory reduction at practical quality-preserving settings
-- decode throughput that exceeds FP16 at long contexts
-- no meaningful quality loss at `>= 3.5` bits per channel
-
-At those settings, the project is designed to turn KV quantization into a real decode-speed optimization rather than only a storage optimization.
-
-## Scope
-
-The primary scope is decoder-only transformer inference on Apple silicon through MLX.
-
-The highest-priority supported configuration is:
-
-- batch-1 decode
-- head dimensions `64`, `128`, and `256`
-- 2-bit, 3-bit, and 4-bit packed KV formats
-- Hadamard-based structured rotation
-- optional offline fused-weight deployment
-
-Lower-bit residual correction, mixed-bit outlier splits, and cold-cache tiering are natural extensions, but the core product is the fused rotated-basis decode path.
-
-Near-term product scope is:
-
-- generic converted attention artifacts from `.npz` checkpoints
-- curated family planners and converters for hand-reviewed model families
-- merged local Qwen snapshots with fused `full_attention` layers and a torque manifest
-- runtime cache profile reconstruction from the artifact manifest
-- synthetic and MLX benchmark entrypoints through the CLI
-
-Universal model-family support for MLX-LM and Hugging Face checkpoints is out of scope for now.
-
-## Evaluation Philosophy
-
-`torque-mlx` is a systems project, so benchmark and evaluation work is part of the product, not an appendix. The project should be judged on:
-
-- tokens/sec and per-token latency
-- time-to-first-token
-- peak KV memory and bytes per cached token
-- perplexity and token-agreement behavior versus FP16
-- performance crossover against FP16 and dequantize-on-fetch baselines
-
-If the kernel architecture does not beat the naive quantized path and eventually beat FP16 at long context, the design has not met its goal.
-
-## Repository Documents
-
-- [PRD.md](./PRD.md): product requirements and release criteria
-- [tqmlx.pdf](./tqmlx.pdf): original technical design write-up
+- [docs/cli.md](./docs/cli.md): command reference
+- [docs/contracts/model-artifact.md](./docs/contracts/model-artifact.md): generic artifact contract
+- [docs/families/qwen.md](./docs/families/qwen.md): curated Qwen workflow
+- [docs/model-support.md](./docs/model-support.md): support matrix and limits
+- [docs/architecture/runtime-boundary.md](./docs/architecture/runtime-boundary.md): Python vs compiled hot-path boundary
+- [PRD.md](./PRD.md): product requirements
 - [TASKS.md](./TASKS.md): implementation backlog
-- [docs/repo-map.md](./docs/repo-map.md): repository structure and code boundaries
-- [docs/contracts/model-artifact.md](./docs/contracts/model-artifact.md): converted model artifact contract
-- [docs/families/qwen.md](./docs/families/qwen.md): curated Qwen conversion workflow
 
-## Attribution and Citations
+## References
 
-Project-local design source:
+Upstream ecosystems:
 
-- [tqmlx.pdf](./tqmlx.pdf) and [tqmlx.tex](./tqmlx.tex) are the original `torque-mlx` design write-up this repository builds from.
+- [MLX](https://github.com/ml-explore/mlx)
+- [MLX-LM](https://github.com/ml-explore/mlx-lm)
+- [Qwen on Hugging Face](https://huggingface.co/Qwen)
 
-Upstream runtimes and ecosystems:
+Design references:
 
-- [MLX](https://github.com/ml-explore/mlx): Apple’s array framework and runtime target for the kernels and cache path in this repo.
-- [MLX-LM](https://github.com/ml-explore/mlx-lm): comparison and integration target for the `TorqueKVCache` API and benchmark baselines.
-- [Qwen on Hugging Face](https://huggingface.co/Qwen): upstream model family referenced by the curated Qwen planning and conversion workflow in this repo.
+- [QuaRot](https://arxiv.org/abs/2404.00456)
+- [KIVI](https://arxiv.org/abs/2402.02750)
+- [RotateKV](https://arxiv.org/abs/2501.16383)
 
-Related research that informs the design direction:
+## License
 
-- [QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs](https://arxiv.org/abs/2404.00456): key reference for rotation-based quantization and Hadamard-style structured transforms.
-- [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache](https://arxiv.org/abs/2402.02750): important baseline for KV-cache quantization and memory/throughput tradeoffs.
-- [RotateKV: Accurate and Robust 2-Bit KV Cache Quantization for LLMs via Outlier-Aware Adaptive Rotations](https://arxiv.org/abs/2501.16383): reference for rotation placement and low-bit KV-cache quantization behavior in modern decoder models.
-
-These citations are intended as attribution for the ideas and ecosystems `torque-mlx` builds on. They should not be read as claims of endorsement or direct code derivation unless a file in this repository says so explicitly.
-
-## License and Model Rights
-
-`torque-mlx` package metadata declares this project’s code as MIT-licensed. That does not change the license terms of any third-party model snapshot you convert with it.
-
-If you use the Qwen or other curated family workflows:
-
-- upstream model weights, tokenizer assets, configs, and safetensors shards remain subject to their original licenses and usage terms
-- converted artifacts should preserve attribution to the original model family and publisher
-- benchmark reports should name both `torque-mlx` and the upstream model/runtime stack they were produced from
+The `torque-mlx` code in this repository is MIT-licensed. Converted model artifacts remain subject to the licenses and usage terms of their upstream model sources.
