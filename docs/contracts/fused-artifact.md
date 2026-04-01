@@ -4,6 +4,8 @@
 
 Offline fusion absorbs the shared rotation into the attention projections so runtime rotation can be removed from the hot path.
 
+This document defines the math and ordering constraints for fusion itself. The full on-disk artifact layout is specified in [model-artifact.md](./model-artifact.md).
+
 ## Weight Convention
 
 The current implementation assumes:
@@ -31,4 +33,3 @@ Minimum artifact metadata:
 ## Ordering Constraint
 
 If a downstream pipeline also quantizes weights, rotation fusion must happen before weight quantization. Otherwise the fused model will not be mathematically equivalent to the original floating-point model.
-

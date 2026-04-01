@@ -12,7 +12,7 @@ class RotationMode(StrEnum):
 
 
 def validate_head_dim(head_dim: int) -> None:
-    if head_dim not in {64, 128}:
+    if head_dim not in {64, 128, 256}:
         raise ValueError(f"Unsupported head dimension for rotation: {head_dim}")
 
 

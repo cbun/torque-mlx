@@ -21,6 +21,7 @@ The implementation uses a generic bitstream packer with deterministic `uint32` o
 
 - head dim 64: 4 words at 2-bit, 6 words at 3-bit, 8 words at 4-bit
 - head dim 128: 8 words at 2-bit, 12 words at 3-bit, 16 words at 4-bit
+- head dim 256: 16 words at 2-bit, 24 words at 3-bit, 32 words at 4-bit
 
 ## Codebooks
 
@@ -43,4 +44,3 @@ Examples:
 
 - `b4-h128-hadamard-unfused`
 - `b3-h64-hadamard-fused`
-

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "torque-mlx"
 version = "0.1.0"
-description = "Rotation-native KV-cache compression for MLX on Apple silicon."
+description = "Model conversion and KV-cache optimization for MLX on Apple silicon."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -20,7 +20,11 @@ classifiers = [
 ]
 dependencies = [
   "numpy>=1.26",
+  "safetensors>=0.4",
 ]
+
+[project.scripts]
+torque-mlx = "torque_mlx.cli:main"
 
 [project.optional-dependencies]
 dev = [

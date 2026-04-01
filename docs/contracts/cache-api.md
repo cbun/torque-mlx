@@ -68,7 +68,6 @@ Decode behavior:
 The cache must fail fast for:
 
 - unsupported bit widths
-- unsupported head dimensions
+- unsupported head dimensions outside the current `64` / `128` / `256` runtime envelope
 - shape mismatches on append or decode
 - malformed codebooks
-

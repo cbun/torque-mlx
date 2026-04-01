@@ -25,6 +25,9 @@ from torque_mlx.quantization import (
         (128, 2, 8),
         (128, 3, 12),
         (128, 4, 16),
+        (256, 2, 16),
+        (256, 3, 24),
+        (256, 4, 32),
     ],
 )
 def test_packed_words_for_head_dim(

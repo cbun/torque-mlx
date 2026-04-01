@@ -14,7 +14,7 @@ from torque_mlx.reference import streaming_attention_decode
 
 @pytest.mark.skipif(not metal_available(), reason="Metal toolchain unavailable")
 @pytest.mark.parametrize("bit_width", [2, 3, 4])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 def test_decode_packed_attention_matches_reference(bit_width: int, head_dim: int) -> None:
     codebook = Codebook(
         bit_width=bit_width,
