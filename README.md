@@ -30,6 +30,7 @@ At the moment, the strongest family-specific path is Qwen:
 - inspect a local snapshot with `torque-mlx plan qwen`
 - rewrite supported `full_attention` layers with `torque-mlx convert-qwen-model`
 - inspect the converted manifest with `torque-mlx inspect-qwen-model`
+- preserve multimodal Qwen vision components unchanged when `vision_config` is present
 
 ## Requirements
 
@@ -45,6 +46,12 @@ For MLX runtime and packed-kernel benchmarks:
 - Apple Silicon
 - `mlx`
 - Xcode / Metal toolchain available to MLX
+
+For Qwen text perplexity evaluation:
+
+- `torch`
+- a `transformers` build with native `qwen3_5` support
+- a local Qwen snapshot plus a raw text file such as `wiki.test.raw`
 
 The current runtime envelope supports:
 
@@ -65,6 +72,12 @@ For tests:
 
 ```bash
 pip install -e .[dev]
+```
+
+For Qwen text perplexity evaluation:
+
+```bash
+pip install -e .[qwen-eval]
 ```
 
 ## Quick Start
@@ -129,15 +142,34 @@ Inspect the converted Qwen manifest:
 torque-mlx inspect-qwen-model --artifact ./artifacts/qwen-torque
 ```
 
+Run text perplexity evaluation against a local source or converted snapshot:
+
+```bash
+torque-mlx eval-qwen-text \
+  --model-dir ./artifacts/qwen-torque \
+  --text-file ./wiki.test.raw \
+  --context-length 2048 \
+  --stride 2048
+```
+
 The current Qwen converter:
 
 - reads a local Hugging Face-style `safetensors` snapshot
 - identifies `full_attention` layers from `config.json`
 - rewrites only supported `q/k/v/o` attention projection weights
 - copies non-converted tensors through unchanged
+- preserves multimodal vision tensors and processor/config assets unchanged
 - emits `torque_qwen_manifest.json` in the output snapshot
 
 It assumes standard Qwen-style tensor suffixes and should be treated as a curated family workflow, not a generic HF converter.
+
+The current Qwen evaluator:
+
+- runs text-only perplexity over a raw text file
+- loads either the original local snapshot or a converted torque snapshot
+- reports safetensor size alongside perplexity
+- is useful for correctness and publishability checks
+- does not mean torque is already reducing full-model weight size on disk
 
 ## How It Works
 

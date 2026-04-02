@@ -17,6 +17,7 @@ from torque_mlx.families.qwen import (
     inspect_qwen_hf_directory,
     load_qwen_model_manifest,
 )
+from torque_mlx.qwen_eval import evaluate_qwen_text_perplexity
 
 
 def _print_json(payload: dict[str, object]) -> None:
@@ -136,6 +137,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     qwen_inspect_model_parser.add_argument("--artifact", required=True, help="Converted Qwen snapshot directory to inspect.")
 
+    qwen_eval_parser = subparsers.add_parser(
+        "eval-qwen-text",
+        help="Run text perplexity evaluation on a local Qwen snapshot.",
+    )
+    qwen_eval_parser.add_argument("--model-dir", required=True, help="Local Qwen snapshot or converted torque snapshot.")
+    qwen_eval_parser.add_argument("--text-file", required=True, help="Raw text file used for perplexity evaluation.")
+    qwen_eval_parser.add_argument("--context-length", type=int, default=2048, help="Maximum token window per forward pass.")
+    qwen_eval_parser.add_argument("--stride", type=int, help="Number of new target tokens to score per window. Defaults to context length.")
+    qwen_eval_parser.add_argument("--max-tokens", type=int, help="Optional cap on the number of tokens read from the text file.")
+    qwen_eval_parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cpu", "mps", "cuda"),
+        help="Torch device for evaluation.",
+    )
+    qwen_eval_parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=("auto", "float32", "float16", "bfloat16"),
+        help="Torch dtype override for model loading.",
+    )
+
     return parser
 
 
@@ -248,6 +271,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "inspect-qwen-model":
         _print_json(load_qwen_model_manifest(args.artifact).summary())
+        return 0
+
+    if args.command == "eval-qwen-text":
+        _print_json(
+            evaluate_qwen_text_perplexity(
+                model_dir=args.model_dir,
+                text_file=args.text_file,
+                context_length=args.context_length,
+                stride=args.stride,
+                max_tokens=args.max_tokens,
+                device=args.device,
+                dtype=args.dtype,
+            ).to_dict(),
+        )
         return 0
 
     parser.error(f"Unknown command: {args.command}")

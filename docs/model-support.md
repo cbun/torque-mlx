@@ -49,6 +49,7 @@ Qwen support is treated as a curated workflow:
 - inspect the local Hugging Face snapshot first
 - convert only layers explicitly marked `full_attention`
 - copy non-convertible layers through unchanged
+- preserve multimodal vision components and processor assets unchanged when `vision_config` is present
 - fail clearly if the model head dimension is outside the supported `64` / `128` / `256` runtime envelope
 
 The family-specific workflow is documented in [families/qwen.md](./families/qwen.md).

@@ -26,6 +26,7 @@ def _write_qwen_config(
     *,
     head_dim: int,
     num_hidden_layers: int = 8,
+    include_vision_config: bool = False,
 ) -> None:
     layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * (num_hidden_layers // 4)
     payload = {
@@ -40,6 +41,12 @@ def _write_qwen_config(
             "layer_types": layer_types,
         },
     }
+    if include_vision_config:
+        payload["vision_config"] = {
+            "model_type": "qwen2_vl",
+            "hidden_size": 1280,
+            "image_size": 384,
+        }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -58,9 +65,21 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _write_qwen_snapshot(model_dir: Path, *, head_dim: int) -> tuple[dict[str, np.ndarray], dict[str, str]]:
-    _write_qwen_config(model_dir / "config.json", head_dim=head_dim, num_hidden_layers=4)
+def _write_qwen_snapshot(
+    model_dir: Path,
+    *,
+    head_dim: int,
+    include_vision_config: bool = False,
+) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    _write_qwen_config(
+        model_dir / "config.json",
+        head_dim=head_dim,
+        num_hidden_layers=4,
+        include_vision_config=include_vision_config,
+    )
     (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    if include_vision_config:
+        (model_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
 
     rng = np.random.default_rng(123)
     tensors = {
@@ -71,6 +90,8 @@ def _write_qwen_snapshot(model_dir: Path, *, head_dim: int) -> tuple[dict[str, n
         "model.layers.0.self_attn.q_proj.weight": rng.normal(size=(head_dim, 32)).astype(np.float32),
         "model.embed_tokens.weight": rng.normal(size=(16, 32)).astype(np.float32),
     }
+    if include_vision_config:
+        tensors["visual.patch_embed.proj.weight"] = rng.normal(size=(32, 3, 14, 14)).astype(np.float32)
     weight_map = {
         "model.layers.3.self_attn.q_proj.weight": "model-00001-of-00002.safetensors",
         "model.layers.3.self_attn.k_proj.weight": "model-00001-of-00002.safetensors",
@@ -79,6 +100,8 @@ def _write_qwen_snapshot(model_dir: Path, *, head_dim: int) -> tuple[dict[str, n
         "model.layers.3.self_attn.o_proj.weight": "model-00002-of-00002.safetensors",
         "model.embed_tokens.weight": "model-00002-of-00002.safetensors",
     }
+    if include_vision_config:
+        weight_map["visual.patch_embed.proj.weight"] = "model-00002-of-00002.safetensors"
     shard1 = {
         key: value
         for key, value in tensors.items()
@@ -143,19 +166,21 @@ def test_qwen_layer_conversion_for_supported_config(tmp_path: Path) -> None:
 
 
 def test_cli_qwen_plan_outputs_supported_report(tmp_path: Path) -> None:
-    _write_qwen_config(tmp_path / "config.json", head_dim=256)
+    _write_qwen_config(tmp_path / "config.json", head_dim=256, include_vision_config=True)
     result = _run_cli("plan", "qwen", "--model-dir", str(tmp_path))
     payload = json.loads(result.stdout)
 
     assert payload["family"] == "qwen"
     assert payload["supported_runtime"] is True
     assert payload["full_attention_indices"] == [3, 7]
+    assert payload["has_vision_config"] is True
+    assert payload["vision_model_type"] == "qwen2_vl"
 
 
 def test_qwen_model_conversion_rewrites_only_supported_attention_layers(tmp_path: Path) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    tensors, _ = _write_qwen_snapshot(model_dir, head_dim=256)
+    tensors, _ = _write_qwen_snapshot(model_dir, head_dim=256, include_vision_config=True)
 
     output_dir = tmp_path / "converted"
     manifest = convert_qwen_model(model_dir=model_dir, output_dir=output_dir, model_name="qwen-demo")
@@ -164,6 +189,8 @@ def test_qwen_model_conversion_rewrites_only_supported_attention_layers(tmp_path
     assert manifest.model_name == "qwen-demo"
     assert loaded_manifest.converted_layer_indices == [3]
     assert loaded_manifest.passthrough_layer_indices == [0, 1, 2]
+    assert loaded_manifest.has_vision_config is True
+    assert loaded_manifest.source_vision_model_type == "qwen2_vl"
 
     rotation = RotationSpec.from_seed(head_dim=256, seed=0)
     expected = fuse_attention_weights(
@@ -201,14 +228,19 @@ def test_qwen_model_conversion_rewrites_only_supported_attention_layers(tmp_path
             np.asarray(handle.get_tensor("model.embed_tokens.weight")),
             tensors["model.embed_tokens.weight"],
         )
+        np.testing.assert_allclose(
+            np.asarray(handle.get_tensor("visual.patch_embed.proj.weight")),
+            tensors["visual.patch_embed.proj.weight"],
+        )
 
     assert (output_dir / "tokenizer.json").exists()
+    assert (output_dir / "preprocessor_config.json").exists()
 
 
 def test_cli_qwen_model_convert_and_inspect(tmp_path: Path) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    _write_qwen_snapshot(model_dir, head_dim=256)
+    _write_qwen_snapshot(model_dir, head_dim=256, include_vision_config=True)
 
     output_dir = tmp_path / "converted"
     convert = _run_cli(
@@ -228,3 +260,4 @@ def test_cli_qwen_model_convert_and_inspect(tmp_path: Path) -> None:
     inspect_payload = json.loads(inspect.stdout)
     assert inspect_payload["model_name"] == "qwen-cli"
     assert inspect_payload["converted_tensor_count"] == 4
+    assert inspect_payload["has_vision_config"] is True

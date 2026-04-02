@@ -72,6 +72,24 @@ Inspect the manifest for a converted Qwen torque snapshot.
 torque-mlx inspect-qwen-model --artifact ./artifacts/qwen3.5-27b-torque
 ```
 
+### `eval-qwen-text`
+
+Run text perplexity evaluation on a local Qwen snapshot or a converted torque snapshot.
+
+```bash
+torque-mlx eval-qwen-text \
+  --model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --text-file ./wiki.test.raw \
+  --context-length 2048 \
+  --stride 2048
+```
+
+Notes:
+
+- this command requires `torch` and a `transformers` build that can load `qwen3_5`
+- it reports text perplexity and safetensor size
+- it is intended for quality validation of curated Qwen artifacts, not for MLX runtime benchmarking
+
 ### `benchmark`
 
 Available benchmark modes:

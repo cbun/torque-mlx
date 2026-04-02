@@ -20,11 +20,13 @@ from torque_mlx.families.qwen import (
     load_qwen_model_manifest,
 )
 from torque_mlx.mlx_ops import decode_packed_attention, metal_available
+from torque_mlx.qwen_eval import QwenTextPerplexityResult, evaluate_qwen_text_perplexity
 
 __all__ = [
     "FusedAttentionWeights",
     "QwenInspectionReport",
     "QwenModelArtifactManifest",
+    "QwenTextPerplexityResult",
     "TorqueArtifact",
     "TorqueArtifactManifest",
     "TorqueConfig",
@@ -40,5 +42,6 @@ __all__ = [
     "load_qwen_model_manifest",
     "load_torque_artifact",
     "metal_available",
+    "evaluate_qwen_text_perplexity",
     "run_synthetic_decode_benchmark",
 ]

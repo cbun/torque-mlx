@@ -30,6 +30,11 @@ torque-mlx = "torque_mlx.cli:main"
 dev = [
   "pytest>=8.3",
 ]
+qwen-eval = [
+  "sentencepiece",
+  "torch",
+  "transformers",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/torque_mlx"]

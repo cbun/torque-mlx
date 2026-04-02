@@ -31,6 +31,8 @@ class QwenInspectionReport:
     architectures: list[str]
     model_type: str
     text_model_type: str | None
+    vision_model_type: str | None
+    has_vision_config: bool
     head_dim: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -49,6 +51,8 @@ class QwenInspectionReport:
             "architectures": list(self.architectures),
             "model_type": self.model_type,
             "text_model_type": self.text_model_type,
+            "vision_model_type": self.vision_model_type,
+            "has_vision_config": self.has_vision_config,
             "head_dim": self.head_dim,
             "num_hidden_layers": self.num_hidden_layers,
             "num_attention_heads": self.num_attention_heads,
@@ -80,6 +84,8 @@ class QwenModelArtifactManifest:
     value_codebook: Codebook
     source_model_type: str
     source_text_model_type: str | None
+    source_vision_model_type: str | None
+    has_vision_config: bool
     source_architectures: list[str]
     format_name: str = "torque-qwen-model"
     format_version: int = 1
@@ -92,6 +98,8 @@ class QwenModelArtifactManifest:
             "source_model_dir": self.source_model_dir,
             "source_model_type": self.source_model_type,
             "source_text_model_type": self.source_text_model_type,
+            "source_vision_model_type": self.source_vision_model_type,
+            "has_vision_config": self.has_vision_config,
             "source_architectures": list(self.source_architectures),
             "runtime_config": {
                 "bit_width": self.runtime_config.bit_width,
@@ -140,6 +148,12 @@ class QwenModelArtifactManifest:
                 if payload.get("source_text_model_type") is not None
                 else None
             ),
+            source_vision_model_type=(
+                str(payload["source_vision_model_type"])
+                if payload.get("source_vision_model_type") is not None
+                else None
+            ),
+            has_vision_config=bool(payload.get("has_vision_config", False)),
             source_architectures=[str(item) for item in payload["source_architectures"]],
             format_name=str(payload.get("format_name", "torque-qwen-model")),
             format_version=int(payload.get("format_version", 1)),
@@ -154,6 +168,8 @@ class QwenModelArtifactManifest:
             "variant_id": self.runtime_config.variant_id,
             "source_model_type": self.source_model_type,
             "source_text_model_type": self.source_text_model_type,
+            "source_vision_model_type": self.source_vision_model_type,
+            "has_vision_config": self.has_vision_config,
             "converted_layer_indices": list(self.converted_layer_indices),
             "passthrough_layer_indices": list(self.passthrough_layer_indices),
             "full_attention_indices": list(self.full_attention_indices),
@@ -187,12 +203,20 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
     text_config = payload.get("text_config", payload)
     if not isinstance(text_config, dict):
         raise ValueError("Expected text_config to be a JSON object")
+    vision_config = payload.get("vision_config")
+    if vision_config is not None and not isinstance(vision_config, dict):
+        raise ValueError("Expected vision_config to be a JSON object when present")
 
     architectures = [str(item) for item in payload.get("architectures", [])]
     model_type = str(payload.get("model_type", ""))
     text_model_type = (
         str(text_config.get("model_type"))
         if text_config.get("model_type") is not None
+        else None
+    )
+    vision_model_type = (
+        str(vision_config.get("model_type"))
+        if isinstance(vision_config, dict) and vision_config.get("model_type") is not None
         else None
     )
     layer_types = [str(item) for item in text_config.get("layer_types", [])]
@@ -227,6 +251,10 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
         "Only full_attention layers are candidates for torque-mlx conversion; linear attention layers are copied through.",
         "Curated family support is explicit. Unsupported Qwen variants should fail during planning rather than convert speculatively.",
     ]
+    if vision_config is not None:
+        notes.append(
+            "Multimodal Qwen snapshots are supported at the conversion layer: text full_attention weights are rewritten, while vision and other non-converted components are copied through unchanged.",
+        )
     if full_attention_indices:
         notes.append(
             f"Detected {len(full_attention_indices)} full_attention layers out of {num_hidden_layers} total layers.",
@@ -237,6 +265,8 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
         architectures=architectures,
         model_type=model_type,
         text_model_type=text_model_type,
+        vision_model_type=vision_model_type,
+        has_vision_config=vision_config is not None,
         head_dim=head_dim,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
@@ -407,6 +437,8 @@ def convert_qwen_model(
         value_codebook=value_codebook,
         source_model_type=report.model_type,
         source_text_model_type=report.text_model_type,
+        source_vision_model_type=report.vision_model_type,
+        has_vision_config=report.has_vision_config,
         source_architectures=list(report.architectures),
     )
     _save_json(Path(output_dir) / QWEN_MODEL_MANIFEST_FILE, manifest.to_dict())
