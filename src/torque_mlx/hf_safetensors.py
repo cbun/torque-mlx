@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import shutil
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
 from safetensors import safe_open
@@ -26,7 +26,7 @@ def build_weight_map(model_dir: str | Path) -> dict[str, str]:
 
     weight_map: dict[str, str] = {}
     for file_path in files:
-        with safe_open(str(file_path), framework="np") as handle:
+        with safe_open(str(file_path), framework="pt") as handle:
             for key in handle.keys():
                 weight_map[str(key)] = file_path.name
     return weight_map
@@ -42,28 +42,39 @@ def find_tensor_key_by_suffix(weight_map: Mapping[str, str], suffix: str) -> str
 
 
 def load_tensor(model_dir: str | Path, tensor_name: str, *, weight_map: Mapping[str, str]) -> np.ndarray:
+    import torch
+
     root = Path(model_dir)
     filename = weight_map[tensor_name]
     path = root / filename
-    with safe_open(str(path), framework="np") as handle:
-        return np.asarray(handle.get_tensor(tensor_name))
+    with safe_open(str(path), framework="pt") as handle:
+        tensor = handle.get_tensor(tensor_name)
+        if not isinstance(tensor, torch.Tensor):
+            return np.asarray(tensor)
+        return tensor.detach().to(dtype=torch.float32).cpu().numpy()
 
-
-def load_file_tensors(model_dir: str | Path, filename: str) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+def load_file_tensors(model_dir: str | Path, filename: str) -> tuple[dict[str, Any], dict[str, str]]:
     root = Path(model_dir)
     path = root / filename
-    tensors: dict[str, np.ndarray] = {}
+    tensors: dict[str, Any] = {}
     metadata: dict[str, str] = {}
-    with safe_open(str(path), framework="np") as handle:
+    with safe_open(str(path), framework="pt") as handle:
         for key in handle.keys():
-            tensors[str(key)] = np.asarray(handle.get_tensor(key))
+            tensors[str(key)] = handle.get_tensor(key)
         meta = handle.metadata()
         if meta:
             metadata = {str(key): str(value) for key, value in meta.items()}
     return tensors, metadata
 
 
-def cast_like(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
+def cast_like(values: np.ndarray, reference):
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    if torch is not None and isinstance(reference, torch.Tensor):
+        return torch.as_tensor(values, dtype=reference.dtype)
     try:
         return np.asarray(values, dtype=reference.dtype)
     except TypeError:
@@ -96,7 +107,17 @@ def materialize_merged_snapshot(
             for tensor_name, override in overrides.items():
                 if weight_map[tensor_name] == source_path.name:
                     tensors[tensor_name] = cast_like(override, tensors[tensor_name])
-            save_file(tensors, str(target_root / source_path.name), metadata=metadata or None)
+            first_tensor = next(iter(tensors.values()), None)
+            try:
+                import torch
+                from safetensors.torch import save_file as save_torch_file
+            except ImportError:
+                torch = None
+                save_torch_file = None
+            if torch is not None and isinstance(first_tensor, torch.Tensor):
+                save_torch_file(tensors, str(target_root / source_path.name), metadata=metadata or None)
+            else:
+                save_file(tensors, str(target_root / source_path.name), metadata=metadata or None)
             continue
         if source_path.is_dir():
             shutil.copytree(source_path, target_root / source_path.name, dirs_exist_ok=True)

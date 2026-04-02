@@ -6,6 +6,8 @@ import sys
 import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
+from safetensors.torch import save_file as save_torch_file
+import torch
 
 from torque_mlx.conversion import fuse_attention_weights
 from torque_mlx.families.qwen import (
@@ -27,6 +29,9 @@ def _write_qwen_config(
     head_dim: int,
     num_hidden_layers: int = 8,
     include_vision_config: bool = False,
+    num_attention_heads: int = 1,
+    num_key_value_heads: int = 1,
+    attn_output_gate: bool = False,
 ) -> None:
     layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"] * (num_hidden_layers // 4)
     payload = {
@@ -36,8 +41,9 @@ def _write_qwen_config(
             "model_type": "qwen3_5_text",
             "head_dim": head_dim,
             "num_hidden_layers": num_hidden_layers,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 4,
+            "num_attention_heads": num_attention_heads,
+            "num_key_value_heads": num_key_value_heads,
+            "attn_output_gate": attn_output_gate,
             "layer_types": layer_types,
         },
     }
@@ -175,6 +181,7 @@ def test_cli_qwen_plan_outputs_supported_report(tmp_path: Path) -> None:
     assert payload["full_attention_indices"] == [3, 7]
     assert payload["has_vision_config"] is True
     assert payload["vision_model_type"] == "qwen2_vl"
+    assert payload["attn_output_gate"] is False
 
 
 def test_qwen_model_conversion_rewrites_only_supported_attention_layers(tmp_path: Path) -> None:
@@ -191,6 +198,7 @@ def test_qwen_model_conversion_rewrites_only_supported_attention_layers(tmp_path
     assert loaded_manifest.passthrough_layer_indices == [0, 1, 2]
     assert loaded_manifest.has_vision_config is True
     assert loaded_manifest.source_vision_model_type == "qwen2_vl"
+    assert loaded_manifest.layer_fusion_modes == {"3": "full_qkvo"}
 
     rotation = RotationSpec.from_seed(head_dim=256, seed=0)
     expected = fuse_attention_weights(
@@ -261,3 +269,123 @@ def test_cli_qwen_model_convert_and_inspect(tmp_path: Path) -> None:
     assert inspect_payload["model_name"] == "qwen-cli"
     assert inspect_payload["converted_tensor_count"] == 4
     assert inspect_payload["has_vision_config"] is True
+    assert inspect_payload["layer_fusion_modes"] == {"3": "full_qkvo"}
+
+
+def test_qwen_model_conversion_supports_bfloat16_source_shards(tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _write_qwen_config(model_dir / "config.json", head_dim=256, num_hidden_layers=4)
+
+    rng = np.random.default_rng(321)
+    tensors = {
+        "model.language_model.layers.3.self_attn.q_proj.weight": torch.tensor(
+            rng.normal(size=(256, 32)).astype(np.float32),
+            dtype=torch.bfloat16,
+        ),
+        "model.language_model.layers.3.self_attn.k_proj.weight": torch.tensor(
+            rng.normal(size=(256, 32)).astype(np.float32),
+            dtype=torch.bfloat16,
+        ),
+        "model.language_model.layers.3.self_attn.v_proj.weight": torch.tensor(
+            rng.normal(size=(256, 32)).astype(np.float32),
+            dtype=torch.bfloat16,
+        ),
+        "model.language_model.layers.3.self_attn.o_proj.weight": torch.tensor(
+            rng.normal(size=(48, 256)).astype(np.float32),
+            dtype=torch.bfloat16,
+        ),
+        "model.language_model.embed_tokens.weight": torch.tensor(
+            rng.normal(size=(16, 32)).astype(np.float32),
+            dtype=torch.bfloat16,
+        ),
+    }
+    save_torch_file(tensors, str(model_dir / "model-00001-of-00001.safetensors"))
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": {key: "model-00001-of-00001.safetensors" for key in tensors},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "converted"
+    manifest = convert_qwen_model(model_dir=model_dir, output_dir=output_dir, model_name="qwen-bf16")
+
+    assert manifest.converted_layer_indices == [3]
+    assert manifest.layer_fusion_modes == {"3": "full_qkvo"}
+
+    with safe_open(str(output_dir / "model-00001-of-00001.safetensors"), framework="pt") as handle:
+        q_proj = handle.get_tensor("model.language_model.layers.3.self_attn.q_proj.weight")
+        embed = handle.get_tensor("model.language_model.embed_tokens.weight")
+        assert q_proj.dtype == torch.bfloat16
+        assert embed.dtype == torch.bfloat16
+
+
+def test_qwen3_5_gated_attention_uses_vo_only_fusion_when_qk_norm_present(tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _write_qwen_config(
+        model_dir / "config.json",
+        head_dim=256,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        attn_output_gate=True,
+    )
+
+    rng = np.random.default_rng(7)
+    tensors = {
+        "model.language_model.layers.3.self_attn.q_proj.weight": rng.normal(size=(4096, 32)).astype(np.float32),
+        "model.language_model.layers.3.self_attn.k_proj.weight": rng.normal(size=(512, 32)).astype(np.float32),
+        "model.language_model.layers.3.self_attn.v_proj.weight": rng.normal(size=(512, 32)).astype(np.float32),
+        "model.language_model.layers.3.self_attn.o_proj.weight": rng.normal(size=(32, 2048)).astype(np.float32),
+        "model.language_model.layers.3.self_attn.q_norm.weight": np.ones((256,), dtype=np.float32),
+        "model.language_model.layers.3.self_attn.k_norm.weight": np.ones((256,), dtype=np.float32),
+        "model.language_model.embed_tokens.weight": rng.normal(size=(16, 32)).astype(np.float32),
+    }
+    save_file(tensors, str(model_dir / "model-00001-of-00001.safetensors"))
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": {key: "model-00001-of-00001.safetensors" for key in tensors},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "converted"
+    manifest = convert_qwen_model(model_dir=model_dir, output_dir=output_dir, model_name="qwen-gated")
+
+    assert manifest.layer_fusion_modes == {"3": "vo_only_runtime_qk_rotation"}
+    assert manifest.converted_tensor_names == {
+        "3": [
+            "model.language_model.layers.3.self_attn.v_proj.weight",
+            "model.language_model.layers.3.self_attn.o_proj.weight",
+        ],
+    }
+
+    with safe_open(str(output_dir / "model-00001-of-00001.safetensors"), framework="np") as handle:
+        np.testing.assert_allclose(
+            np.asarray(handle.get_tensor("model.language_model.layers.3.self_attn.q_proj.weight")),
+            tensors["model.language_model.layers.3.self_attn.q_proj.weight"],
+        )
+        np.testing.assert_allclose(
+            np.asarray(handle.get_tensor("model.language_model.layers.3.self_attn.k_proj.weight")),
+            tensors["model.language_model.layers.3.self_attn.k_proj.weight"],
+        )
+        assert not np.allclose(
+            np.asarray(handle.get_tensor("model.language_model.layers.3.self_attn.v_proj.weight")),
+            tensors["model.language_model.layers.3.self_attn.v_proj.weight"],
+        )
+        assert not np.allclose(
+            np.asarray(handle.get_tensor("model.language_model.layers.3.self_attn.o_proj.weight")),
+            tensors["model.language_model.layers.3.self_attn.o_proj.weight"],
+        )

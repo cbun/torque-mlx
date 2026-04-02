@@ -66,6 +66,7 @@ def _write_manifest(model_dir: Path) -> None:
         converted_layer_indices=[3],
         passthrough_layer_indices=[0, 1, 2],
         converted_tensor_names={"3": ["model.layers.3.self_attn.q_proj.weight"]},
+        layer_fusion_modes={"3": "full_qkvo"},
         key_codebook=Codebook(bit_width=4, centroids=np.linspace(-1.0, 1.0, 16, dtype=np.float32), name="gaussian"),
         value_codebook=Codebook(bit_width=4, centroids=np.linspace(-1.0, 1.0, 16, dtype=np.float32), name="gaussian"),
         source_model_type="qwen3_5",

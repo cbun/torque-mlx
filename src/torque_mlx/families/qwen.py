@@ -9,7 +9,6 @@ import numpy as np
 
 from torque_mlx.artifact import TorqueArtifact, build_torque_artifact
 from torque_mlx.config import TorqueConfig
-from torque_mlx.conversion import fuse_attention_weights
 from torque_mlx.hf_safetensors import (
     build_weight_map,
     find_tensor_key_by_suffix,
@@ -37,6 +36,7 @@ class QwenInspectionReport:
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
+    attn_output_gate: bool
     layer_types: list[str]
     full_attention_indices: list[int]
     linear_attention_indices: list[int]
@@ -57,6 +57,7 @@ class QwenInspectionReport:
             "num_hidden_layers": self.num_hidden_layers,
             "num_attention_heads": self.num_attention_heads,
             "num_key_value_heads": self.num_key_value_heads,
+            "attn_output_gate": self.attn_output_gate,
             "layer_types": list(self.layer_types),
             "full_attention_indices": list(self.full_attention_indices),
             "linear_attention_indices": list(self.linear_attention_indices),
@@ -80,6 +81,7 @@ class QwenModelArtifactManifest:
     converted_layer_indices: list[int]
     passthrough_layer_indices: list[int]
     converted_tensor_names: dict[str, list[str]]
+    layer_fusion_modes: dict[str, str]
     key_codebook: Codebook
     value_codebook: Codebook
     source_model_type: str
@@ -114,6 +116,7 @@ class QwenModelArtifactManifest:
             "converted_layer_indices": list(self.converted_layer_indices),
             "passthrough_layer_indices": list(self.passthrough_layer_indices),
             "converted_tensor_names": {str(key): list(value) for key, value in self.converted_tensor_names.items()},
+            "layer_fusion_modes": dict(self.layer_fusion_modes),
             "key_codebook": self.key_codebook.to_dict(),
             "value_codebook": self.value_codebook.to_dict(),
         }
@@ -139,6 +142,10 @@ class QwenModelArtifactManifest:
             converted_tensor_names={
                 str(key): [str(item) for item in value]
                 for key, value in dict(payload["converted_tensor_names"]).items()
+            },
+            layer_fusion_modes={
+                str(key): str(value)
+                for key, value in dict(payload.get("layer_fusion_modes", {})).items()
             },
             key_codebook=Codebook.from_dict(dict(payload["key_codebook"])),
             value_codebook=Codebook.from_dict(dict(payload["value_codebook"])),
@@ -174,6 +181,7 @@ class QwenModelArtifactManifest:
             "passthrough_layer_indices": list(self.passthrough_layer_indices),
             "full_attention_indices": list(self.full_attention_indices),
             "converted_tensor_count": int(sum(len(items) for items in self.converted_tensor_names.values())),
+            "layer_fusion_modes": dict(self.layer_fusion_modes),
             "key_codebook": {
                 "name": self.key_codebook.name,
                 "bit_width": self.key_codebook.bit_width,
@@ -230,6 +238,7 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
     num_hidden_layers = int(text_config["num_hidden_layers"])
     num_attention_heads = int(text_config["num_attention_heads"])
     num_key_value_heads = int(text_config["num_key_value_heads"])
+    attn_output_gate = bool(text_config.get("attn_output_gate", False))
 
     blocking_issues: list[str] = []
     if model_type not in SUPPORTED_QWEN_MODEL_TYPES:
@@ -271,6 +280,7 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads,
+        attn_output_gate=attn_output_gate,
         layer_types=layer_types,
         full_attention_indices=full_attention_indices,
         linear_attention_indices=linear_attention_indices,
@@ -354,6 +364,136 @@ def _layer_projection_suffixes(layer_idx: int) -> dict[str, str]:
     }
 
 
+def _optional_tensor_key_by_suffix(weight_map: Mapping[str, str], suffix: str) -> str | None:
+    matches = [key for key in weight_map if key.endswith(suffix)]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise ValueError(f"Expected at most one tensor ending with {suffix}, found {matches}")
+    return matches[0]
+
+
+def _rotate_stacked_output_projection(
+    weight: np.ndarray,
+    *,
+    head_dim: int,
+    num_blocks: int,
+    rotation: RotationSpec,
+) -> np.ndarray:
+    array = np.asarray(weight, dtype=np.float32)
+    if array.shape[0] != num_blocks * head_dim:
+        raise ValueError(
+            f"Expected projection output dim {num_blocks * head_dim}, got {array.shape[0]}",
+        )
+    reshaped = array.reshape(num_blocks, head_dim, array.shape[1])
+    rotated = np.matmul(rotation.matrix()[None, :, :], reshaped)
+    return rotated.reshape(array.shape)
+
+
+def _inverse_rotate_stacked_input_projection(
+    weight: np.ndarray,
+    *,
+    head_dim: int,
+    num_blocks: int,
+    rotation: RotationSpec,
+) -> np.ndarray:
+    array = np.asarray(weight, dtype=np.float32)
+    if array.shape[1] != num_blocks * head_dim:
+        raise ValueError(
+            f"Expected projection input dim {num_blocks * head_dim}, got {array.shape[1]}",
+        )
+    reshaped = array.reshape(array.shape[0], num_blocks, head_dim)
+    rotated = np.matmul(reshaped, rotation.matrix().T)
+    return rotated.reshape(array.shape)
+
+
+def _fuse_qwen_full_attention_tensors(
+    *,
+    q_proj: np.ndarray,
+    k_proj: np.ndarray,
+    v_proj: np.ndarray,
+    o_proj: np.ndarray,
+    rotation: RotationSpec,
+    head_dim: int,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    attn_output_gate: bool,
+    has_q_norm: bool,
+    has_k_norm: bool,
+) -> tuple[dict[str, np.ndarray], str]:
+    expected_q_rows = num_attention_heads * head_dim
+    expected_q_proj_rows = expected_q_rows * (2 if attn_output_gate else 1)
+    expected_kv_rows = num_key_value_heads * head_dim
+
+    if q_proj.shape[0] != expected_q_proj_rows:
+        raise ValueError(
+            f"Expected q_proj output dim {expected_q_proj_rows}, got {q_proj.shape[0]}",
+        )
+    if k_proj.shape[0] != expected_kv_rows:
+        raise ValueError(
+            f"Expected k_proj output dim {expected_kv_rows}, got {k_proj.shape[0]}",
+        )
+    if v_proj.shape[0] != expected_kv_rows:
+        raise ValueError(
+            f"Expected v_proj output dim {expected_kv_rows}, got {v_proj.shape[0]}",
+        )
+    if o_proj.shape[1] != expected_q_rows:
+        raise ValueError(
+            f"Expected o_proj input dim {expected_q_rows}, got {o_proj.shape[1]}",
+        )
+
+    fused_v = _rotate_stacked_output_projection(
+        v_proj,
+        head_dim=head_dim,
+        num_blocks=num_key_value_heads,
+        rotation=rotation,
+    )
+    fused_o = _inverse_rotate_stacked_input_projection(
+        o_proj,
+        head_dim=head_dim,
+        num_blocks=num_attention_heads,
+        rotation=rotation,
+    )
+
+    if has_q_norm or has_k_norm:
+        return (
+            {
+                "w_v": fused_v,
+                "w_o": fused_o,
+            },
+            "vo_only_runtime_qk_rotation",
+        )
+
+    q_rows = expected_q_rows
+    q_base = np.asarray(q_proj[:q_rows], dtype=np.float32)
+    q_gate = np.asarray(q_proj[q_rows:], dtype=np.float32) if attn_output_gate else None
+    fused_q = _rotate_stacked_output_projection(
+        q_base,
+        head_dim=head_dim,
+        num_blocks=num_attention_heads,
+        rotation=rotation,
+    )
+    fused_k = _rotate_stacked_output_projection(
+        k_proj,
+        head_dim=head_dim,
+        num_blocks=num_key_value_heads,
+        rotation=rotation,
+    )
+
+    if q_gate is not None:
+        fused_q = np.concatenate([fused_q, q_gate], axis=0)
+
+    return (
+        {
+            "w_q": fused_q,
+            "w_k": fused_k,
+            "w_v": fused_v,
+            "w_o": fused_o,
+        },
+        "full_qkvo",
+    )
+
+
 def convert_qwen_model(
     *,
     model_dir: str | Path,
@@ -386,6 +526,7 @@ def convert_qwen_model(
     weight_map = build_weight_map(model_dir)
     overrides: dict[str, np.ndarray] = {}
     converted_tensor_names: dict[str, list[str]] = {}
+    layer_fusion_modes: dict[str, str] = {}
 
     for layer_idx in report.full_attention_indices:
         suffixes = _layer_projection_suffixes(layer_idx)
@@ -397,23 +538,41 @@ def convert_qwen_model(
             name: load_tensor(model_dir, tensor_name, weight_map=weight_map)
             for name, tensor_name in keys.items()
         }
-        fused = fuse_attention_weights(
-            w_q=weights["w_q"],
-            w_k=weights["w_k"],
-            w_v=weights["w_v"],
-            w_o=weights["w_o"],
-            rotation=rotation,
+        q_norm_name = _optional_tensor_key_by_suffix(
+            weight_map,
+            f".layers.{layer_idx}.self_attn.q_norm.weight",
         )
-        overrides[keys["w_q"]] = fused.w_q
-        overrides[keys["w_k"]] = fused.w_k
-        overrides[keys["w_v"]] = fused.w_v
-        overrides[keys["w_o"]] = fused.w_o
-        converted_tensor_names[str(layer_idx)] = [
-            keys["w_q"],
-            keys["w_k"],
-            keys["w_v"],
-            keys["w_o"],
-        ]
+        k_norm_name = _optional_tensor_key_by_suffix(
+            weight_map,
+            f".layers.{layer_idx}.self_attn.k_norm.weight",
+        )
+        fused_weights, fusion_mode = _fuse_qwen_full_attention_tensors(
+            q_proj=weights["w_q"],
+            k_proj=weights["w_k"],
+            v_proj=weights["w_v"],
+            o_proj=weights["w_o"],
+            rotation=rotation,
+            head_dim=report.head_dim,
+            num_attention_heads=report.num_attention_heads,
+            num_key_value_heads=report.num_key_value_heads,
+            attn_output_gate=report.attn_output_gate,
+            has_q_norm=q_norm_name is not None,
+            has_k_norm=k_norm_name is not None,
+        )
+        if "w_q" in fused_weights:
+            overrides[keys["w_q"]] = fused_weights["w_q"]
+        if "w_k" in fused_weights:
+            overrides[keys["w_k"]] = fused_weights["w_k"]
+        if "w_v" in fused_weights:
+            overrides[keys["w_v"]] = fused_weights["w_v"]
+        if "w_o" in fused_weights:
+            overrides[keys["w_o"]] = fused_weights["w_o"]
+        converted = []
+        for name in ("w_q", "w_k", "w_v", "w_o"):
+            if name in fused_weights:
+                converted.append(keys[name])
+        converted_tensor_names[str(layer_idx)] = converted
+        layer_fusion_modes[str(layer_idx)] = fusion_mode
 
     materialize_merged_snapshot(
         source_dir=model_dir,
@@ -433,6 +592,7 @@ def convert_qwen_model(
             layer_idx for layer_idx in range(report.num_hidden_layers) if layer_idx not in report.full_attention_indices
         ],
         converted_tensor_names=converted_tensor_names,
+        layer_fusion_modes=layer_fusion_modes,
         key_codebook=key_codebook,
         value_codebook=value_codebook,
         source_model_type=report.model_type,
