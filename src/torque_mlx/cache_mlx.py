@@ -65,6 +65,7 @@ class TorqueKVCacheMLX:
     _tail_keys: Any = field(init=False, repr=False)
     _tail_values: Any = field(init=False, repr=False)
     _tail_length: int = field(init=False, repr=False)
+    _query_index_cache: dict[int, tuple[Any, Any] | Any] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         import mlx.core as mx
@@ -110,6 +111,7 @@ class TorqueKVCacheMLX:
         self._rotation_inverse_matrix = mx.array(rotation_matrix)
         self._use_append_pack_kernel = metal_available()
         self._tail_length = 0
+        self._query_index_cache = {}
         self._tail_keys = mx.zeros(
             (self.config.num_layers, self.config.kv_heads, max(1, self.decode_tail_capacity), self.config.head_dim),
             dtype=mx.float32,
@@ -182,17 +184,21 @@ class TorqueKVCacheMLX:
             else queries
         )
         query_rot_flat = mx.reshape(query_rot, (self.config.num_layers * query_heads, self.config.head_dim))
-
-        layer_indices_np = np.repeat(np.arange(self.config.num_layers, dtype=np.int32), query_heads)
-        query_head_indices_np = np.tile(np.arange(query_heads, dtype=np.int32), self.config.num_layers)
-        kv_head_indices_np = query_head_indices_np // kv_group_ratio
-        layer_indices = mx.array(layer_indices_np)
-        kv_head_indices = mx.array(kv_head_indices_np)
+        indices = self._grouped_query_indices(query_heads=query_heads, kv_group_ratio=kv_group_ratio)
+        if self.config.num_layers == 1:
+            kv_head_indices = indices
+            layer_indices = None
+        else:
+            layer_indices, kv_head_indices = indices
         packed_length = self.sequence_length - self._tail_length
 
         if self._tail_length == 0:
-            batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
-            batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
+            if self.config.num_layers == 1:
+                batched_k_codes = self._key_codes[0, kv_head_indices, :packed_length, :]
+                batched_v_codes = self._value_codes[0, kv_head_indices, :packed_length, :]
+            else:
+                batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
+                batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
             out_rot = self._decode_packed_batch(
                 query_rot_flat=query_rot_flat,
                 batched_k_codes=batched_k_codes,
@@ -417,16 +423,24 @@ class TorqueKVCacheMLX:
         import mlx.core as mx
 
         scale = 1.0 / np.sqrt(self.config.head_dim)
-        tail_keys = self._tail_keys[layer_indices, kv_head_indices, : self._tail_length, :]
-        tail_values = self._tail_values[layer_indices, kv_head_indices, : self._tail_length, :]
+        if self.config.num_layers == 1:
+            tail_keys = self._tail_keys[0, kv_head_indices, : self._tail_length, :]
+            tail_values = self._tail_values[0, kv_head_indices, : self._tail_length, :]
+        else:
+            tail_keys = self._tail_keys[layer_indices, kv_head_indices, : self._tail_length, :]
+            tail_values = self._tail_values[layer_indices, kv_head_indices, : self._tail_length, :]
         tail_scores = mx.sum(tail_keys * mx.expand_dims(query_rot_flat, axis=1), axis=-1)
 
         if packed_length == 0:
             tail_weights = mx.softmax(tail_scores * scale, axis=1)
             return mx.sum(mx.expand_dims(tail_weights, axis=-1) * tail_values, axis=1)
 
-        batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
-        batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
+        if self.config.num_layers == 1:
+            batched_k_codes = self._key_codes[0, kv_head_indices, :packed_length, :]
+            batched_v_codes = self._value_codes[0, kv_head_indices, :packed_length, :]
+        else:
+            batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
+            batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
         packed_scores = score_packed_query_batched(
             query_rot_flat,
             batched_k_codes,
@@ -448,6 +462,24 @@ class TorqueKVCacheMLX:
             axis=1,
         )
         return packed_out + tail_out
+
+    def _grouped_query_indices(self, *, query_heads: int, kv_group_ratio: int):
+        import mlx.core as mx
+
+        cached = self._query_index_cache.get(query_heads)
+        if cached is not None:
+            return cached
+
+        if self.config.num_layers == 1:
+            kv_head_indices = mx.array(np.arange(query_heads, dtype=np.int32) // kv_group_ratio)
+            self._query_index_cache[query_heads] = kv_head_indices
+            return kv_head_indices
+
+        layer_indices = mx.array(np.repeat(np.arange(self.config.num_layers, dtype=np.int32), query_heads))
+        query_head_indices = np.tile(np.arange(query_heads, dtype=np.int32), self.config.num_layers)
+        kv_head_indices = mx.array(query_head_indices // kv_group_ratio)
+        self._query_index_cache[query_heads] = (layer_indices, kv_head_indices)
+        return self._query_index_cache[query_heads]
 
     def _normalize_query_heads_device(self, values, label: str):
         import mlx.core as mx
