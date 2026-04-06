@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 from math import ceil
 from pathlib import Path
@@ -124,6 +125,29 @@ def quantize(values: np.ndarray, codebook: Codebook) -> np.ndarray:
     return indices.reshape(array.shape)
 
 
+def codebook_boundaries(codebook: Codebook | np.ndarray | object) -> np.ndarray:
+    centroids = (
+        np.asarray(codebook.centroids, dtype=np.float32)
+        if isinstance(codebook, Codebook)
+        else np.asarray(codebook, dtype=np.float32)
+    )
+    if centroids.ndim != 1 or centroids.size < 2:
+        raise ValueError("Expected at least two sorted centroids to build quantization boundaries")
+    return ((centroids[:-1] + centroids[1:]) / 2.0).astype(np.float32)
+
+
+def quantize_mlx(values, codebook: Codebook | object, *, boundaries=None):
+    import mlx.core as mx
+
+    array = mx.array(values, dtype=mx.float32)
+    resolved_boundaries = (
+        mx.array(codebook_boundaries(codebook), dtype=mx.float32)
+        if boundaries is None
+        else mx.array(boundaries, dtype=mx.float32)
+    )
+    return mx.sum(mx.expand_dims(array, axis=-1) > resolved_boundaries, axis=-1).astype(mx.uint32)
+
+
 def dequantize(indices: np.ndarray, codebook: Codebook) -> np.ndarray:
     codes = np.asarray(indices)
     return codebook.centroids[codes].astype(np.float32)
@@ -147,6 +171,102 @@ def pack_indices(indices: np.ndarray, bit_width: int) -> np.ndarray:
             words[word_index + 1] |= np.uint32(value >> (bit_width - spill))
         bit_offset += bit_width
     return words
+
+
+def pack_indices_batched(indices: np.ndarray, bit_width: int) -> np.ndarray:
+    _validate_bit_width(bit_width)
+    values = np.asarray(indices, dtype=np.uint32)
+    if values.ndim == 1:
+        return pack_indices(values, bit_width)
+
+    count = values.shape[-1]
+    flat = values.reshape(-1, count)
+    max_value = 1 << bit_width
+    if np.any(flat >= max_value):
+        raise ValueError(f"Index out of range for {bit_width}-bit packing")
+
+    packed = np.zeros(
+        (flat.shape[0], packed_words_for_head_dim(count, bit_width)),
+        dtype=np.uint32,
+    )
+    for idx in range(count):
+        bit_offset = idx * bit_width
+        word_index = bit_offset // WORD_BITS
+        shift = bit_offset % WORD_BITS
+        packed[:, word_index] |= flat[:, idx] << shift
+        spill = shift + bit_width - WORD_BITS
+        if spill > 0:
+            packed[:, word_index + 1] |= flat[:, idx] >> (bit_width - spill)
+
+    return packed.reshape(*values.shape[:-1], packed.shape[-1])
+
+
+@lru_cache(maxsize=None)
+def _pack_word_plan(count: int, bit_width: int):
+    packed_words = packed_words_for_head_dim(count, bit_width)
+    low_indices: list[list[int]] = [[] for _ in range(packed_words)]
+    low_shifts: list[list[int]] = [[] for _ in range(packed_words)]
+    spill_indices: list[list[int]] = [[] for _ in range(packed_words)]
+    spill_shifts: list[list[int]] = [[] for _ in range(packed_words)]
+
+    for idx in range(count):
+        bit_offset = idx * bit_width
+        word_index = bit_offset // WORD_BITS
+        shift = bit_offset % WORD_BITS
+        low_indices[word_index].append(idx)
+        low_shifts[word_index].append(shift)
+        spill = shift + bit_width - WORD_BITS
+        if spill > 0:
+            spill_indices[word_index + 1].append(idx)
+            spill_shifts[word_index + 1].append(bit_width - spill)
+
+    return tuple(
+        (
+            tuple(low_indices[word_index]),
+            tuple(low_shifts[word_index]),
+            tuple(spill_indices[word_index]),
+            tuple(spill_shifts[word_index]),
+        )
+        for word_index in range(packed_words)
+    )
+
+
+def pack_indices_batched_mlx(indices, bit_width: int):
+    import mlx.core as mx
+
+    _validate_bit_width(bit_width)
+    values = mx.array(indices, dtype=mx.uint32)
+    if len(values.shape) == 1:
+        values = mx.reshape(values, (1, int(values.shape[0])))
+        squeeze = True
+    else:
+        squeeze = False
+
+    count = int(values.shape[-1])
+    flat = mx.reshape(values, (-1, count))
+    max_value = 1 << bit_width
+    if bool(mx.any(flat >= max_value).item()):
+        raise ValueError(f"Index out of range for {bit_width}-bit packing")
+
+    packed_words = packed_words_for_head_dim(count, bit_width)
+    packed_columns = []
+    for low_idx, low_shift, spill_idx, spill_shift in _pack_word_plan(count, bit_width):
+        word_values = mx.zeros((int(flat.shape[0]),), dtype=mx.uint32)
+        if low_idx:
+            low_values = flat[:, list(low_idx)]
+            low_shift_values = mx.array(low_shift, dtype=mx.uint32).reshape(1, -1)
+            word_values = word_values + mx.sum(low_values << low_shift_values, axis=1).astype(mx.uint32)
+        if spill_idx:
+            spill_values = flat[:, list(spill_idx)]
+            spill_shift_values = mx.array(spill_shift, dtype=mx.uint32).reshape(1, -1)
+            word_values = word_values + mx.sum(spill_values >> spill_shift_values, axis=1).astype(mx.uint32)
+        packed_columns.append(word_values)
+
+    packed = mx.stack(packed_columns, axis=1) if packed_columns else mx.zeros((int(flat.shape[0]), 0), dtype=mx.uint32)
+    result = mx.reshape(packed, (*values.shape[:-1], packed_words))
+    if squeeze:
+        return result[0]
+    return result
 
 
 def unpack_indices(words: np.ndarray, bit_width: int, count: int) -> np.ndarray:

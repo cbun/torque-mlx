@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import shutil
 from typing import Any, Mapping
 
 import numpy as np
@@ -11,6 +12,7 @@ from torque_mlx.artifact import TorqueArtifact, build_torque_artifact
 from torque_mlx.config import TorqueConfig
 from torque_mlx.hf_safetensors import (
     build_weight_map,
+    copy_non_weight_assets,
     find_tensor_key_by_suffix,
     load_tensor,
     materialize_merged_snapshot,
@@ -22,6 +24,8 @@ from torque_mlx.rotation import RotationMode, RotationSpec
 SUPPORTED_QWEN_MODEL_TYPES = {"qwen3_5", "qwen3_5_text"}
 SUPPORTED_QWEN_ATTENTION_LAYER_TYPE = "full_attention"
 QWEN_MODEL_MANIFEST_FILE = "torque_qwen_manifest.json"
+QWEN_DELTA_WEIGHTS_FILE = "torque_qwen_delta_weights.npz"
+SUPPORTED_QWEN_ARTIFACT_LAYOUTS = {"merged_snapshot", "delta_npz"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +93,24 @@ class QwenModelArtifactManifest:
     source_vision_model_type: str | None
     has_vision_config: bool
     source_architectures: list[str]
+    artifact_layout: str = "merged_snapshot"
+    delta_weights_file: str | None = None
+    stored_asset_files: list[str] = None
     format_name: str = "torque-qwen-model"
     format_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.artifact_layout not in SUPPORTED_QWEN_ARTIFACT_LAYOUTS:
+            raise ValueError(
+                "artifact_layout must be one of "
+                + ", ".join(sorted(SUPPORTED_QWEN_ARTIFACT_LAYOUTS)),
+            )
+        if self.artifact_layout == "delta_npz" and not self.delta_weights_file:
+            raise ValueError("delta_weights_file is required for delta_npz artifacts")
+        if self.artifact_layout != "delta_npz" and self.delta_weights_file is not None:
+            raise ValueError("delta_weights_file is only valid for delta_npz artifacts")
+        if self.stored_asset_files is None:
+            object.__setattr__(self, "stored_asset_files", [])
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -103,6 +123,9 @@ class QwenModelArtifactManifest:
             "source_vision_model_type": self.source_vision_model_type,
             "has_vision_config": self.has_vision_config,
             "source_architectures": list(self.source_architectures),
+            "artifact_layout": self.artifact_layout,
+            "delta_weights_file": self.delta_weights_file,
+            "stored_asset_files": list(self.stored_asset_files),
             "runtime_config": {
                 "bit_width": self.runtime_config.bit_width,
                 "head_dim": self.runtime_config.head_dim,
@@ -162,6 +185,13 @@ class QwenModelArtifactManifest:
             ),
             has_vision_config=bool(payload.get("has_vision_config", False)),
             source_architectures=[str(item) for item in payload["source_architectures"]],
+            artifact_layout=str(payload.get("artifact_layout", "merged_snapshot")),
+            delta_weights_file=(
+                str(payload["delta_weights_file"])
+                if payload.get("delta_weights_file") is not None
+                else None
+            ),
+            stored_asset_files=[str(item) for item in payload.get("stored_asset_files", [])],
             format_name=str(payload.get("format_name", "torque-qwen-model")),
             format_version=int(payload.get("format_version", 1)),
         )
@@ -177,6 +207,9 @@ class QwenModelArtifactManifest:
             "source_text_model_type": self.source_text_model_type,
             "source_vision_model_type": self.source_vision_model_type,
             "has_vision_config": self.has_vision_config,
+            "artifact_layout": self.artifact_layout,
+            "delta_weights_file": self.delta_weights_file,
+            "stored_asset_file_count": len(self.stored_asset_files),
             "converted_layer_indices": list(self.converted_layer_indices),
             "passthrough_layer_indices": list(self.passthrough_layer_indices),
             "full_attention_indices": list(self.full_attention_indices),
@@ -199,6 +232,32 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _save_json(path: Path, payload: Mapping[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _materialize_delta_artifact(
+    *,
+    source_dir: str | Path,
+    output_dir: str | Path,
+    overrides: Mapping[str, np.ndarray],
+    force: bool,
+) -> tuple[Path, list[str]]:
+    source_root = Path(source_dir)
+    target_root = Path(output_dir)
+
+    if target_root.exists() and any(target_root.iterdir()) and not force:
+        raise FileExistsError(
+            f"Refusing to overwrite non-empty output directory {target_root}; pass force=True to replace it",
+        )
+    if target_root.exists() and force:
+        shutil.rmtree(target_root)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    stored_asset_files = copy_non_weight_assets(source_dir=source_root, output_dir=target_root)
+    np.savez_compressed(
+        target_root / QWEN_DELTA_WEIGHTS_FILE,
+        **{name: np.asarray(value, dtype=np.float32) for name, value in overrides.items()},
+    )
+    return target_root, stored_asset_files
 
 
 def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
@@ -501,6 +560,7 @@ def convert_qwen_model(
     bit_width: int = 4,
     rotation_seed: int = 0,
     model_name: str | None = None,
+    artifact_layout: str = "merged_snapshot",
     force: bool = False,
 ) -> QwenModelArtifactManifest:
     report = inspect_qwen_hf_directory(model_dir)
@@ -508,6 +568,11 @@ def convert_qwen_model(
         raise ValueError(
             "Qwen model is not currently supported by torque-mlx: "
             + "; ".join(report.blocking_issues),
+        )
+    if artifact_layout not in SUPPORTED_QWEN_ARTIFACT_LAYOUTS:
+        raise ValueError(
+            "artifact_layout must be one of "
+            + ", ".join(sorted(SUPPORTED_QWEN_ARTIFACT_LAYOUTS)),
         )
 
     runtime_config = TorqueConfig(
@@ -574,13 +639,22 @@ def convert_qwen_model(
         converted_tensor_names[str(layer_idx)] = converted
         layer_fusion_modes[str(layer_idx)] = fusion_mode
 
-    materialize_merged_snapshot(
-        source_dir=model_dir,
-        output_dir=output_dir,
-        overrides=overrides,
-        weight_map=weight_map,
-        force=force,
-    )
+    stored_asset_files: list[str] = []
+    if artifact_layout == "merged_snapshot":
+        materialize_merged_snapshot(
+            source_dir=model_dir,
+            output_dir=output_dir,
+            overrides=overrides,
+            weight_map=weight_map,
+            force=force,
+        )
+    else:
+        _, stored_asset_files = _materialize_delta_artifact(
+            source_dir=model_dir,
+            output_dir=output_dir,
+            overrides=overrides,
+            force=force,
+        )
 
     manifest = QwenModelArtifactManifest(
         model_name=model_name or Path(report.model_dir).name,
@@ -600,6 +674,9 @@ def convert_qwen_model(
         source_vision_model_type=report.vision_model_type,
         has_vision_config=report.has_vision_config,
         source_architectures=list(report.architectures),
+        artifact_layout=artifact_layout,
+        delta_weights_file=QWEN_DELTA_WEIGHTS_FILE if artifact_layout == "delta_npz" else None,
+        stored_asset_files=stored_asset_files,
     )
     _save_json(Path(output_dir) / QWEN_MODEL_MANIFEST_FILE, manifest.to_dict())
     return manifest

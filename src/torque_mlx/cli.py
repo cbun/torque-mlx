@@ -17,7 +17,10 @@ from torque_mlx.families.qwen import (
     inspect_qwen_hf_directory,
     load_qwen_model_manifest,
 )
-from torque_mlx.qwen_eval import evaluate_qwen_text_perplexity
+from torque_mlx.cache_mlx import SUPPORTED_DECODE_STRATEGIES
+from torque_mlx.qwen_eval import benchmark_qwen_text_models, evaluate_qwen_text_perplexity
+from torque_mlx.qwen_mlx import benchmark_qwen_mlx_generation
+from torque_mlx.qwen_benchmark import run_qwen_decode_runtime_benchmark
 
 
 def _print_json(payload: dict[str, object]) -> None:
@@ -88,6 +91,93 @@ def build_parser() -> argparse.ArgumentParser:
     mlx_lm_parser.add_argument("--bit-width", type=int, default=4)
     mlx_lm_parser.add_argument("--seed", type=int, default=0)
 
+    qwen_text_benchmark_parser = benchmark_subparsers.add_parser(
+        "qwen-text",
+        help="Compare source and converted Qwen snapshots on the same text workload.",
+    )
+    qwen_text_benchmark_parser.add_argument("--source-model-dir", required=True, help="Original local Qwen snapshot.")
+    qwen_text_benchmark_parser.add_argument("--torque-model-dir", required=True, help="Converted torque Qwen snapshot.")
+    qwen_text_benchmark_parser.add_argument("--text-file", required=True, help="Raw text file used for perplexity benchmarking.")
+    qwen_text_benchmark_parser.add_argument(
+        "--context-length",
+        action="append",
+        dest="context_lengths",
+        type=int,
+        required=True,
+        help="Context length to benchmark. Repeat the flag to benchmark multiple context lengths.",
+    )
+    qwen_text_benchmark_parser.add_argument(
+        "--stride",
+        type=int,
+        help="Number of new target tokens scored per window. Defaults to each context length.",
+    )
+    qwen_text_benchmark_parser.add_argument("--max-tokens", type=int, help="Optional cap on tokens read from the text file.")
+    qwen_text_benchmark_parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cpu", "mps", "cuda"),
+        help="Torch device for evaluation.",
+    )
+    qwen_text_benchmark_parser.add_argument(
+        "--dtype",
+        default="auto",
+        choices=("auto", "float32", "float16", "bfloat16"),
+        help="Torch dtype override for model loading.",
+    )
+
+    qwen_decode_benchmark_parser = benchmark_subparsers.add_parser(
+        "qwen-decode",
+        help="Benchmark the MLX KV decode hot path using real Qwen model geometry.",
+    )
+    qwen_decode_benchmark_parser.add_argument(
+        "--model-dir",
+        required=True,
+        help="Local Qwen snapshot or converted torque snapshot used to derive the decode benchmark profile.",
+    )
+    qwen_decode_benchmark_parser.add_argument("--prefill-tokens", type=int, default=2048, help="Initial KV cache length before timed decode begins.")
+    qwen_decode_benchmark_parser.add_argument("--decode-steps", type=int, default=128, help="Number of autoregressive decode steps to time.")
+    qwen_decode_benchmark_parser.add_argument("--seed", type=int, default=0, help="Random seed for the synthetic Q/K/V workload.")
+    qwen_decode_benchmark_parser.add_argument("--bit-width", type=int, help="Bit width override when benchmarking from an unconverted source snapshot.")
+    qwen_decode_benchmark_parser.add_argument("--rotation-seed", type=int, default=0, help="Rotation seed override when benchmarking from an unconverted source snapshot.")
+    qwen_decode_benchmark_parser.add_argument(
+        "--decode-strategy",
+        default="split_batched",
+        choices=SUPPORTED_DECODE_STRATEGIES,
+        help="Torque decode kernel strategy. 'split_batched' is the default. 'auto' currently aliases 'split_batched'; 'fused_per_head' remains available as an explicit fallback for comparison.",
+    )
+
+    qwen_generate_benchmark_parser = benchmark_subparsers.add_parser(
+        "qwen-generate",
+        help="Run a real MLX generation pass for a local Qwen or converted torque artifact.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--model-dir",
+        required=True,
+        help="Local Qwen snapshot or converted torque artifact to load through the MLX runtime adapter.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--prompt",
+        required=True,
+        help="Prompt used for generation benchmarking.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=64,
+        help="Maximum number of tokens to generate.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=512,
+        help="Prompt prefill chunk size passed through to mlx-lm generation.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--profile-runtime",
+        action="store_true",
+        help="Synchronize and report converted-layer dense prefill, torque append, and torque decode timings.",
+    )
+
     eval_parser = subparsers.add_parser(
         "eval",
         help="Run artifact-level evaluation using the synthetic decode harness.",
@@ -129,6 +219,12 @@ def build_parser() -> argparse.ArgumentParser:
     qwen_convert_model_parser.add_argument("--model-name", help="Optional model name recorded in the torque manifest.")
     qwen_convert_model_parser.add_argument("--bit-width", type=int, default=4, help="KV cache bit width for the runtime profile.")
     qwen_convert_model_parser.add_argument("--rotation-seed", type=int, default=0, help="Structured rotation seed.")
+    qwen_convert_model_parser.add_argument(
+        "--artifact-layout",
+        default="merged_snapshot",
+        choices=("merged_snapshot", "delta_npz"),
+        help="Artifact layout. 'merged_snapshot' rewrites a full local snapshot; 'delta_npz' stores only converted tensor overrides plus a manifest that references the source model directory.",
+    )
     qwen_convert_model_parser.add_argument("--force", action="store_true", help="Overwrite a non-empty output directory.")
 
     qwen_inspect_model_parser = subparsers.add_parser(
@@ -222,6 +318,44 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
             return 0
+        if args.benchmark_command == "qwen-text":
+            _print_json(
+                benchmark_qwen_text_models(
+                    source_model_dir=args.source_model_dir,
+                    torque_model_dir=args.torque_model_dir,
+                    text_file=args.text_file,
+                    context_lengths=args.context_lengths,
+                    stride=args.stride,
+                    max_tokens=args.max_tokens,
+                    device=args.device,
+                    dtype=args.dtype,
+                ).to_dict(),
+            )
+            return 0
+        if args.benchmark_command == "qwen-decode":
+            _print_json(
+                run_qwen_decode_runtime_benchmark(
+                    model_dir=args.model_dir,
+                    prefill_tokens=args.prefill_tokens,
+                    decode_steps=args.decode_steps,
+                    seed=args.seed,
+                    bit_width=args.bit_width,
+                    rotation_seed=args.rotation_seed,
+                    decode_strategy=args.decode_strategy,
+                ).to_dict(),
+            )
+            return 0
+        if args.benchmark_command == "qwen-generate":
+            _print_json(
+                benchmark_qwen_mlx_generation(
+                    model_dir=args.model_dir,
+                    prompt=args.prompt,
+                    max_tokens=args.max_tokens,
+                    prefill_step_size=args.prefill_step_size,
+                    profile_runtime=args.profile_runtime,
+                ).to_dict(),
+            )
+            return 0
         parser.error(f"Unknown benchmark command: {args.benchmark_command}")
 
     if args.command == "eval":
@@ -262,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
             bit_width=args.bit_width,
             rotation_seed=args.rotation_seed,
             model_name=args.model_name,
+            artifact_layout=args.artifact_layout,
             force=args.force,
         )
         payload = manifest.summary()

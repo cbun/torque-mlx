@@ -9,3 +9,12 @@ dist/
 .venv/
 venv/
 
+# Local model snapshots, converted artifacts, and eval data
+artifacts/
+*.safetensors
+*.safetensors.index.json
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf

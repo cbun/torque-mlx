@@ -126,3 +126,31 @@ def materialize_merged_snapshot(
             shutil.copy2(source_path, target_root / source_path.name)
 
     return target_root
+
+
+def copy_non_weight_assets(
+    *,
+    source_dir: str | Path,
+    output_dir: str | Path,
+) -> list[str]:
+    source_root = Path(source_dir)
+    target_root = Path(output_dir)
+    copied: list[str] = []
+
+    for source_path in source_root.iterdir():
+        if source_path.name == ".cache":
+            continue
+        if source_path.is_file() and (
+            source_path.name.endswith(".safetensors")
+            or source_path.name == "model.safetensors.index.json"
+        ):
+            continue
+        if source_path.is_dir():
+            shutil.copytree(source_path, target_root / source_path.name, dirs_exist_ok=True)
+            copied.append(source_path.name + "/")
+            continue
+        if source_path.is_file():
+            shutil.copy2(source_path, target_root / source_path.name)
+            copied.append(source_path.name)
+
+    return sorted(copied)

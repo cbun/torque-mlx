@@ -272,6 +272,37 @@ def test_cli_qwen_model_convert_and_inspect(tmp_path: Path) -> None:
     assert inspect_payload["layer_fusion_modes"] == {"3": "full_qkvo"}
 
 
+def test_qwen_model_conversion_supports_delta_artifact_layout(tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _write_qwen_snapshot(model_dir, head_dim=256, include_vision_config=True)
+
+    output_dir = tmp_path / "delta"
+    manifest = convert_qwen_model(
+        model_dir=model_dir,
+        output_dir=output_dir,
+        model_name="qwen-delta",
+        artifact_layout="delta_npz",
+    )
+
+    loaded_manifest = load_qwen_model_manifest(output_dir)
+    assert manifest.artifact_layout == "delta_npz"
+    assert loaded_manifest.delta_weights_file == "torque_qwen_delta_weights.npz"
+    assert loaded_manifest.stored_asset_files
+    assert not any(output_dir.glob("*.safetensors"))
+    assert not (output_dir / "model.safetensors.index.json").exists()
+    assert (output_dir / "torque_qwen_delta_weights.npz").exists()
+    assert (output_dir / "tokenizer.json").exists()
+
+    delta = np.load(output_dir / "torque_qwen_delta_weights.npz")
+    assert set(delta.files) == {
+        "model.layers.3.self_attn.q_proj.weight",
+        "model.layers.3.self_attn.k_proj.weight",
+        "model.layers.3.self_attn.v_proj.weight",
+        "model.layers.3.self_attn.o_proj.weight",
+    }
+
+
 def test_qwen_model_conversion_supports_bfloat16_source_shards(tmp_path: Path) -> None:
     model_dir = tmp_path / "model"
     model_dir.mkdir()

@@ -52,6 +52,15 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [ ] Validate register pressure and occupancy with Metal profiling
 - [ ] Benchmark codebook access strategies and keep the winning path
 - [x] Decide whether the hot path must move into MLX core C++
+- [x] Replace the Python-list MLX cache path with a GPU-resident packed slab
+- [x] Batch decode across converted layers and KV heads to remove per-head dispatch overhead
+- [x] Move query rotation and output unrotation onto the MLX device path
+- [x] Add a runtime strategy switch so batched split and per-head fused kernels can be compared explicitly
+- [x] Evaluate a batched split-kernel path against the current fused kernel and promote the faster design
+- [ ] Make the split-batched kernel saturate GPU occupancy on Apple silicon
+- [ ] Reduce bit-unpack and codebook-lookup overhead in the split-batched kernel path
+- [ ] Revisit threadgroup/grid layout and SIMD-group work partitioning for long-context decode
+- [ ] Decide whether the split-batched hot path must move into MLX core C++ / precompiled Metal
 
 ## Phase 6: Offline Weight Fusion
 
@@ -59,6 +68,10 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [x] Define artifact format and metadata for fused-weight models
 - [x] Add equivalence tests against unfused exact-arithmetic reference paths
 - [x] Document ordering constraints with downstream weight quantization pipelines
+- [x] Add a true compressed converted-model artifact format instead of dense `safetensors` rewrites
+- [x] Define loader/runtime contracts for compressed whole-model artifacts
+- [ ] Support exact Qwen-family fusion beyond `vo_only_runtime_qk_rotation` where architecture permits
+- [ ] Investigate and reduce the observed Qwen3.5 `2B` quality drift in real-model evals
 
 ## Phase 7: Benchmarks and Evals
 
@@ -66,8 +79,15 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [x] Add FP16 KV baseline
 - [x] Add naive dequantize-on-fetch quantized baseline
 - [x] Add MLX-LM quantized baseline where available
+- [x] Make the Qwen decode benchmark model grouped-query attention faithfully
 - [ ] Run quality evaluation on WikiText-2
 - [ ] Run at least one long-context evaluation benchmark
+- [x] Re-run Qwen decode benchmarks at multiple prefills after the GPU-resident cache upgrade
+- [x] Add a real MLX generation benchmark for converted Qwen snapshots
+- [ ] Benchmark real-model MLX generation on Qwen3.5 `0.8B`, `2B`, and a larger target model
+- [ ] Measure GPU occupancy/utilization alongside throughput and KV bytes/token
+- [ ] Benchmark `4096+` token prefills on the split-batched default path
+- [ ] Publish a benchmark report that clearly separates synthetic decode geometry from real-model runtime results
 - [x] Publish a reproducible benchmark report
 
 ## Phase 8: Packaging and Release
@@ -75,6 +95,8 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [x] Write user-facing integration docs
 - [x] Document supported hardware and model matrix
 - [x] Mark experimental modes clearly
+- [x] Ship a real MLX runtime adapter that loads converted Qwen artifacts end-to-end
+- [ ] Publish at least one compressed converted artifact once the runtime and quality bar are met
 - [ ] Cut an initial tagged release once acceptance criteria are met
 
 ## Stretch Goals

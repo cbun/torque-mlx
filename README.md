@@ -104,6 +104,28 @@ torque-mlx benchmark synthetic \
   --bit-width 4
 ```
 
+Compare a source and converted Qwen snapshot on the same text workload:
+
+```bash
+torque-mlx benchmark qwen-text \
+  --source-model-dir ./artifacts/qwen3.5-0.8b-source \
+  --torque-model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --text-file ./artifacts/wiki.test.raw \
+  --context-length 512 \
+  --context-length 2048 \
+  --max-tokens 2048
+```
+
+Benchmark the MLX decode hot path using real Qwen geometry:
+
+```bash
+torque-mlx benchmark qwen-decode \
+  --model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --prefill-tokens 2048 \
+  --decode-steps 128 \
+  --decode-strategy split_batched
+```
+
 Evaluate an artifact:
 
 ```bash
@@ -136,6 +158,16 @@ torque-mlx convert-qwen-model \
   --model-name qwen-torque
 ```
 
+Or emit a smaller delta artifact that stores only converted tensor overrides and references the source snapshot:
+
+```bash
+torque-mlx convert-qwen-model \
+  --model-dir /path/to/qwen-snapshot \
+  --output-dir ./artifacts/qwen-torque-delta \
+  --model-name qwen-torque-delta \
+  --artifact-layout delta_npz
+```
+
 Inspect the converted Qwen manifest:
 
 ```bash
@@ -152,12 +184,24 @@ torque-mlx eval-qwen-text \
   --stride 2048
 ```
 
+Run an experimental MLX generation pass against a local source or converted artifact:
+
+```bash
+torque-mlx benchmark qwen-generate \
+  --model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --prompt "hello" \
+  --max-tokens 32 \
+  --prefill-step-size 512 \
+  --profile-runtime
+```
+
 The current Qwen converter:
 
 - reads a local Hugging Face-style `safetensors` snapshot
 - identifies `full_attention` layers from `config.json`
 - rewrites only supported `q/k/v/o` attention projection weights
-- copies non-converted tensors through unchanged
+- can either rewrite a full merged snapshot or emit a delta artifact with only converted tensor overrides
+- copies non-converted tensors through unchanged when writing a merged snapshot
 - preserves multimodal vision tensors and processor/config assets unchanged
 - emits `torque_qwen_manifest.json` in the output snapshot
 
@@ -167,9 +211,40 @@ The current Qwen evaluator:
 
 - runs text-only perplexity over a raw text file
 - loads either the original local snapshot or a converted torque snapshot
+- applies the matching torque runtime correction when a converted Qwen manifest is present
+- can load a `delta_npz` torque artifact by applying stored override tensors on top of the referenced source model
 - reports safetensor size alongside perplexity
+- reports loader time, evaluation time, and evaluated tokens per second
 - is useful for correctness and publishability checks
 - does not mean torque is already reducing full-model weight size on disk
+
+The Qwen text benchmark:
+
+- compares a source snapshot against a converted torque snapshot
+- runs the same workload at one or more context lengths
+- reports perplexity, size, and timing deltas per context length
+- is the current correctness and model-behavior check, not the main MLX performance benchmark
+
+The experimental Qwen MLX generation benchmark:
+
+- loads local `qwen3_5` snapshots through a repo-local MLX adapter that normalizes them onto the `qwen3_next` text runtime
+- can load both merged converted snapshots and `delta_npz` artifacts
+- can optionally synchronize and report converted-layer dense prefill, prompt append, decode append, aggregate append, and torque decode timings via `--profile-runtime`
+- uses dense cache prefill for hybrid Qwen3.5 prompt chunks, then routes converted `full_attention` decode through `TorqueKVCacheMLX`
+- buffers single-token decode appends through a small dense tail before flushing them into packed storage
+- reports prompt throughput, generation throughput, generated token count, and peak memory
+- is the first end-to-end MLX runtime path for converted Qwen artifacts in this repo
+- should still be treated as experimental until longer prompts and larger models are benchmarked systematically
+
+The Qwen decode benchmark:
+
+- derives head dimension, KV heads, and converted-layer count from a local Qwen snapshot or torque manifest
+- models grouped-query attention using the source model's `num_attention_heads` to `num_key_value_heads` ratio
+- benchmarks the KV-growing autoregressive decode path on MLX
+- compares MLX-LM FP16 cache decode, MLX-LM quantized cache decode, and `TorqueKVCache`
+- reports projected KV cache bytes against FP16 so the memory story is explicit
+- breaks timing into cache update/append, decode compute, and residual host overhead
+- is the benchmark that lines up most directly with the repo's core performance thesis
 
 ## How It Works
 

@@ -62,6 +62,23 @@ This command:
 - preserves multimodal Qwen snapshots by copying the vision stack and processor assets through unchanged
 - emits `torque_qwen_manifest.json` in the output snapshot
 
+If you want a smaller converted artifact that stores only the rewritten tensors, use the delta layout:
+
+```bash
+torque-mlx convert-qwen-model \
+  --model-dir /path/to/qwen-snapshot \
+  --output-dir ./artifacts/qwen3.5-27b-torque-delta \
+  --model-name qwen3.5-27b-torque-delta \
+  --artifact-layout delta_npz
+```
+
+The delta layout:
+
+- stores only converted tensor overrides in `torque_qwen_delta_weights.npz`
+- copies non-weight assets such as config/tokenizer files
+- keeps a manifest pointer back to the original source snapshot
+- is smaller on disk than a full rewritten snapshot, but still depends on the base source model to run
+
 For multimodal Qwen snapshots such as `Qwen3.5-0.8B`, the current support boundary is:
 
 - text `full_attention` layers are converted
@@ -87,10 +104,72 @@ The evaluator:
 
 - tokenizes the raw text file
 - runs sliding-window perplexity over the local snapshot
+- applies the matching torque runtime correction for converted `vo_only_runtime_qk_rotation` layers
+- can load `delta_npz` artifacts by applying the stored overrides to the referenced source model first
 - reports safetensor size in bytes and GiB
+- reports loader time, evaluation time, and evaluated tokens per second
 - includes `torque_qwen_manifest.json` metadata when present
 
 This is a publishability and correctness check for curated Qwen artifacts. It does not imply that the repository already has a production MLX runtime for converted Qwen snapshots, and it does not yet produce a smaller full-model weight format on disk.
+
+## Experimental MLX Runtime
+
+For an end-to-end MLX generation smoke on a local source or converted artifact, run:
+
+```bash
+torque-mlx benchmark qwen-generate \
+  --model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --prompt "hello" \
+  --max-tokens 32 \
+  --prefill-step-size 512 \
+  --profile-runtime
+```
+
+The current adapter:
+
+- normalizes local `qwen3_5` snapshots onto a repo-local MLX `qwen3_next` compatibility model
+- supports the hybrid Qwen3.5 text stack, including `linear_attention` passthrough layers and converted `full_attention` layers
+- can load merged snapshots directly
+- can load `delta_npz` artifacts by loading the referenced base snapshot and applying the stored overrides first
+- uses dense-cache prompt prefill for converted full-attention layers, then switches those layers onto `TorqueKVCacheMLX` for single-token decode
+- buffers single-token decode appends through a small dense tail before flushing them into packed storage
+- can emit converted-layer runtime timing breakdowns with `--profile-runtime` to separate dense prefill, prompt append, decode append, aggregate append, and torque decode costs
+
+This is intentionally narrow. It is an experimental generation/runtime path for curated Qwen3.5 artifacts, not a generic MLX loader for arbitrary Hugging Face checkpoints.
+
+For a direct source-vs-torque comparison, use:
+
+```bash
+torque-mlx benchmark qwen-text \
+  --source-model-dir ./artifacts/qwen3.5-0.8b-source \
+  --torque-model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --text-file ./artifacts/wiki.test.raw \
+  --context-length 512 \
+  --context-length 2048 \
+  --max-tokens 2048
+```
+
+This benchmark is the current model-level report for curated Qwen artifacts. It shows whether the converted snapshot preserves perplexity, whether its on-disk size changed, and whether the current evaluation runtime got faster or slower.
+
+For a decode-path benchmark aligned with `torque-mlx`'s actual thesis, use:
+
+```bash
+torque-mlx benchmark qwen-decode \
+  --model-dir ./artifacts/qwen3.5-0.8b-torque \
+  --prefill-tokens 2048 \
+  --decode-steps 128 \
+  --decode-strategy split_batched
+```
+
+This benchmark:
+
+- derives the decode geometry from the local Qwen snapshot or torque manifest
+- benchmarks only the autoregressive KV-growing decode path on MLX
+- compares MLX-LM FP16, MLX-LM quantized cache, and `TorqueKVCache`
+- defaults to the batched split kernel and can still force the prior per-head fused kernel for comparison
+- reports projected KV cache bytes saved against FP16
+
+It is the right benchmark for answering whether torque improves the cache hot path. The text benchmark above is still useful, but it is a correctness check rather than a decode-kernel performance claim.
 
 ## Publishing Guidance
 
