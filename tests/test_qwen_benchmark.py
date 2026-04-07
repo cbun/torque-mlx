@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from torque_mlx.cli import main
+from torque_mlx.cli import build_parser, main
 from torque_mlx.config import TorqueConfig
 from torque_mlx.families.qwen import QWEN_MODEL_MANIFEST_FILE, QwenModelArtifactManifest
 from torque_mlx.qwen_benchmark import (
@@ -23,6 +23,7 @@ def _write_qwen_config(model_dir: Path) -> None:
         "model_type": "qwen3_5",
         "text_config": {
             "model_type": "qwen3_5",
+            "hidden_size": 1024,
             "head_dim": 256,
             "num_hidden_layers": 4,
             "num_attention_heads": 8,
@@ -80,6 +81,7 @@ def test_load_qwen_decode_benchmark_profile_from_source_snapshot(tmp_path: Path)
 
     assert isinstance(profile, QwenDecodeBenchmarkProfile)
     assert profile.profile_source == "hf_snapshot"
+    assert profile.hidden_size == 1024
     assert profile.head_dim == 256
     assert profile.num_attention_heads == 8
     assert profile.num_key_value_heads == 2
@@ -101,6 +103,7 @@ def test_load_qwen_decode_benchmark_profile_from_manifest_recovers_source_geomet
     profile = load_qwen_decode_benchmark_profile(artifact_dir)
 
     assert profile.profile_source == "torque_manifest"
+    assert profile.hidden_size == 1024
     assert profile.num_attention_heads == 8
     assert profile.num_key_value_heads == 2
     assert profile.bit_width == 4
@@ -118,12 +121,14 @@ def test_run_qwen_decode_runtime_benchmark_uses_injected_runner(tmp_path: Path) 
         assert profile.target_layer_count == 1
         assert kwargs["prefill_tokens"] == 128
         assert kwargs["decode_steps"] == 16
+        assert kwargs["decode_tail_capacity"] == 8
         return QwenDecodeRuntimeBenchmarkResult(
             profile=profile,
             prefill_tokens=128,
             decode_steps=16,
             seed=3,
             torque_decode_strategy=kwargs["decode_strategy"],
+            torque_decode_tail_capacity=8,
             fp16_update_seconds=0.2,
             fp16_attention_seconds=0.3,
             fp16_decode_seconds=1.0,
@@ -150,6 +155,7 @@ def test_run_qwen_decode_runtime_benchmark_uses_injected_runner(tmp_path: Path) 
     assert payload["benchmark"] == "qwen_decode_runtime"
     assert payload["profile"]["target_layer_count"] == 1
     assert payload["torque_decode_strategy"] == "split_batched"
+    assert payload["torque_decode_tail_capacity"] == 8
     assert payload["torque_mlx_tokens_per_sec"] == 32.0
     assert payload["torque_mlx_append_ms"] == 100.0
 
@@ -162,11 +168,13 @@ def test_cli_benchmark_qwen_decode_dispatch(monkeypatch: pytest.MonkeyPatch, cap
         assert kwargs["model_dir"] == str(model_dir)
         assert kwargs["prefill_tokens"] == 256
         assert kwargs["decode_steps"] == 32
+        assert kwargs["decode_tail_capacity"] is None
         profile = QwenDecodeBenchmarkProfile(
             model_dir=str(model_dir),
             profile_source="hf_snapshot",
             model_type="qwen3_5",
             text_model_type="qwen3_5",
+            hidden_size=1024,
             head_dim=256,
             num_hidden_layers=4,
             num_attention_heads=8,
@@ -184,6 +192,7 @@ def test_cli_benchmark_qwen_decode_dispatch(monkeypatch: pytest.MonkeyPatch, cap
             decode_steps=32,
             seed=0,
             torque_decode_strategy=kwargs["decode_strategy"],
+            torque_decode_tail_capacity=8,
             fp16_update_seconds=0.2,
             fp16_attention_seconds=0.3,
             fp16_decode_seconds=1.0,
@@ -219,3 +228,25 @@ def test_cli_benchmark_qwen_decode_dispatch(monkeypatch: pytest.MonkeyPatch, cap
     assert payload["benchmark"] == "qwen_decode_runtime"
     assert payload["profile"]["target_layer_count"] == 1
     assert payload["torque_decode_strategy"] == "split_batched"
+    assert payload["torque_decode_tail_capacity"] == 8
+
+
+def test_cli_parser_accepts_qwen_decode_tail_capacity() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "benchmark",
+            "qwen-decode",
+            "--model-dir",
+            "./artifact",
+            "--prefill-tokens",
+            "128",
+            "--decode-steps",
+            "16",
+            "--decode-tail-capacity",
+            "96",
+        ],
+    )
+
+    assert args.benchmark_command == "qwen-decode"
+    assert args.decode_tail_capacity == 96

@@ -154,6 +154,7 @@ This report includes:
 - the derived Qwen geometry and converted-layer count
 - the grouped-query ratio between attention heads and KV heads
 - the requested torque decode strategy (`split_batched` by default; `auto` currently aliases it)
+- the resolved dense decode-tail capacity before buffered tokens are flushed into packed storage
 - projected FP16 vs torque KV cache bytes
 - MLX-LM FP16 decode timing
 - MLX-LM quantized decode timing
@@ -171,6 +172,7 @@ torque-mlx benchmark qwen-generate \
   --prompt "hello" \
   --max-tokens 32 \
   --prefill-step-size 512 \
+  --ignore-eos \
   --profile-runtime
 ```
 
@@ -182,7 +184,14 @@ This report includes:
 - prompt tokens and prompt tokens/sec
 - generated tokens and generation tokens/sec
 - peak MLX memory during the run
-- optional converted-layer timing breakdowns for dense prefill, prompt append, decode append, aggregate append, and torque decode when `--profile-runtime` is set
+- converted-layer KV cache tokens plus estimated FP16 bytes, packed bytes, and bytes saved for the torque-targeted full-attention layers
+- the resolved dense decode-tail capacity used by the torque cache
+- optional converted-layer timing breakdowns for dense prefill, prompt append, decode append, aggregate append, torque decode, packed score, softmax/merge, packed value accumulation, and dense-tail work when `--profile-runtime` is set
+
+Notes:
+
+- if `--decode-tail-capacity` is omitted, the runtime chooses a Qwen-specific default from the text hidden size instead of using one hard-coded value for every model
+- `--ignore-eos` keeps generation running until `max_tokens`, which is useful for fixed-length source-vs-torque performance comparisons
 
 This command exercises the repo-local MLX adapter for `qwen3_5` snapshots. It is the current end-to-end generation smoke path for converted Qwen artifacts, but it should still be treated as experimental.
 

@@ -36,6 +36,7 @@ class QwenInspectionReport:
     text_model_type: str | None
     vision_model_type: str | None
     has_vision_config: bool
+    hidden_size: int
     head_dim: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -57,6 +58,7 @@ class QwenInspectionReport:
             "text_model_type": self.text_model_type,
             "vision_model_type": self.vision_model_type,
             "has_vision_config": self.has_vision_config,
+            "hidden_size": self.hidden_size,
             "head_dim": self.head_dim,
             "num_hidden_layers": self.num_hidden_layers,
             "num_attention_heads": self.num_attention_heads,
@@ -296,6 +298,7 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
     head_dim = int(text_config["head_dim"])
     num_hidden_layers = int(text_config["num_hidden_layers"])
     num_attention_heads = int(text_config["num_attention_heads"])
+    hidden_size = int(text_config.get("hidden_size", head_dim * num_attention_heads))
     num_key_value_heads = int(text_config["num_key_value_heads"])
     attn_output_gate = bool(text_config.get("attn_output_gate", False))
 
@@ -335,6 +338,7 @@ def inspect_qwen_hf_directory(model_dir: str | Path) -> QwenInspectionReport:
         text_model_type=text_model_type,
         vision_model_type=vision_model_type,
         has_vision_config=vision_config is not None,
+        hidden_size=hidden_size,
         head_dim=head_dim,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,

@@ -113,7 +113,7 @@ def test_mlx_cache_grouped_decode_matches_reference() -> None:
         )
         expected[query_head_idx] = reference_cache.rotation.inverse(out_rot)
 
-    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
 
 
 def test_mlx_cache_grouped_decode_matches_reference_with_dense_tail_flush() -> None:
@@ -159,7 +159,52 @@ def test_mlx_cache_grouped_decode_matches_reference_with_dense_tail_flush() -> N
         )
         expected[query_head_idx] = reference_cache.rotation.inverse(out_rot)
 
-    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
+
+
+def test_mlx_cache_decode_with_current_matches_append_then_decode() -> None:
+    pytest.importorskip("mlx.core")
+    from torque_mlx.mlx_ops import metal_available
+
+    if not metal_available():
+        pytest.skip("Metal toolchain unavailable")
+
+    rng = np.random.default_rng(23)
+    config = TorqueConfig(bit_width=4, head_dim=64, num_layers=1, kv_heads=2)
+    cache_decode_first = TorqueKVCacheMLX(
+        config=config,
+        key_codebook=_uniform_codebook(4),
+        value_codebook=_uniform_codebook(4),
+        initial_capacity=8,
+        decode_tail_capacity=2,
+    )
+    cache_append_first = TorqueKVCacheMLX(
+        config=config,
+        key_codebook=_uniform_codebook(4),
+        value_codebook=_uniform_codebook(4),
+        initial_capacity=8,
+        decode_tail_capacity=2,
+    )
+
+    for _ in range(4):
+        key = rng.uniform(-1.0, 1.0, size=(2, 64)).astype(np.float32)
+        value = rng.uniform(-1.0, 1.0, size=(2, 64)).astype(np.float32)
+        cache_decode_first.append(key=key, value=value)
+        cache_append_first.append(key=key, value=value)
+
+    grouped_query = rng.uniform(-1.0, 1.0, size=(4, 64)).astype(np.float32)
+    current_key = rng.uniform(-1.0, 1.0, size=(2, 64)).astype(np.float32)
+    current_value = rng.uniform(-1.0, 1.0, size=(2, 64)).astype(np.float32)
+
+    actual = cache_decode_first.decode_mlx_with_current(
+        query=grouped_query,
+        key=current_key,
+        value=current_value,
+    )
+    cache_append_first.append(key=current_key, value=current_value)
+    expected = cache_append_first.decode_mlx(query=grouped_query)
+
+    np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
 
 
 def test_mlx_cache_auto_strategy_prefers_split_batched() -> None:

@@ -145,6 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_DECODE_STRATEGIES,
         help="Torque decode kernel strategy. 'split_batched' is the default. 'auto' currently aliases 'split_batched'; 'fused_per_head' remains available as an explicit fallback for comparison.",
     )
+    qwen_decode_benchmark_parser.add_argument(
+        "--decode-tail-capacity",
+        type=int,
+        help="Override the number of recent decode tokens kept dense before they are flushed into packed storage. Defaults to an auto heuristic based on the Qwen text hidden size.",
+    )
 
     qwen_generate_benchmark_parser = benchmark_subparsers.add_parser(
         "qwen-generate",
@@ -176,6 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile-runtime",
         action="store_true",
         help="Synchronize and report converted-layer dense prefill, torque append, and torque decode timings.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Continue generation until max_tokens even if the model emits EOS. Useful for fixed-length performance comparisons.",
+    )
+    qwen_generate_benchmark_parser.add_argument(
+        "--decode-tail-capacity",
+        type=int,
+        help="Override the number of recent decode tokens kept dense before they are flushed into packed storage. Defaults to an auto heuristic based on the Qwen text hidden size.",
     )
 
     eval_parser = subparsers.add_parser(
@@ -342,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                     bit_width=args.bit_width,
                     rotation_seed=args.rotation_seed,
                     decode_strategy=args.decode_strategy,
+                    decode_tail_capacity=args.decode_tail_capacity,
                 ).to_dict(),
             )
             return 0
@@ -350,11 +366,13 @@ def main(argv: list[str] | None = None) -> int:
                 benchmark_qwen_mlx_generation(
                     model_dir=args.model_dir,
                     prompt=args.prompt,
-                    max_tokens=args.max_tokens,
-                    prefill_step_size=args.prefill_step_size,
-                    profile_runtime=args.profile_runtime,
-                ).to_dict(),
-            )
+                max_tokens=args.max_tokens,
+                prefill_step_size=args.prefill_step_size,
+                profile_runtime=args.profile_runtime,
+                decode_tail_capacity=args.decode_tail_capacity,
+                ignore_eos=args.ignore_eos,
+            ).to_dict(),
+        )
             return 0
         parser.error(f"Unknown benchmark command: {args.benchmark_command}")
 

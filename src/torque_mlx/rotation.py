@@ -32,6 +32,22 @@ def _fwht_last_axis(values: np.ndarray) -> np.ndarray:
     return result
 
 
+def _fwht_last_axis_mlx(values):
+    import mlx.core as mx
+
+    result = mx.array(values)
+    head_dim = int(result.shape[-1])
+    step = 1
+    while step < head_dim:
+        block_count = head_dim // (2 * step)
+        reshaped = mx.reshape(result, (*result.shape[:-1], block_count, 2 * step))
+        left = reshaped[..., :step]
+        right = reshaped[..., step : 2 * step]
+        result = mx.reshape(mx.concatenate([left + right, left - right], axis=-1), result.shape)
+        step *= 2
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class RotationSpec:
     """Structured orthogonal rotation Pi = D1 H D2."""
@@ -92,3 +108,29 @@ class RotationSpec:
 
 def apply_structured_rotation(values: np.ndarray, head_dim: int, seed: int = 0) -> np.ndarray:
     return RotationSpec.from_seed(head_dim=head_dim, seed=seed).apply(values)
+
+
+def apply_structured_rotation_mlx(values, *, signs_left, signs_right):
+    import mlx.core as mx
+
+    array = mx.array(values, dtype=mx.float32)
+    head_dim = int(array.shape[-1])
+    validate_head_dim(head_dim)
+    right = mx.array(signs_right, dtype=mx.float32)
+    left = mx.array(signs_left, dtype=mx.float32)
+    rotated = array * right
+    rotated = _fwht_last_axis_mlx(rotated) / sqrt(head_dim)
+    return rotated * left
+
+
+def inverse_structured_rotation_mlx(values, *, signs_left, signs_right):
+    import mlx.core as mx
+
+    array = mx.array(values, dtype=mx.float32)
+    head_dim = int(array.shape[-1])
+    validate_head_dim(head_dim)
+    left = mx.array(signs_left, dtype=mx.float32)
+    right = mx.array(signs_right, dtype=mx.float32)
+    rotated = array * left
+    rotated = _fwht_last_axis_mlx(rotated) / sqrt(head_dim)
+    return rotated * right

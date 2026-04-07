@@ -168,9 +168,9 @@ def test_fused_and_split_decode_match() -> None:
 
 
 @pytest.mark.skipif(not metal_available(), reason="Metal toolchain unavailable")
-def test_batched_split_decode_matches_reference() -> None:
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_batched_split_decode_matches_reference(head_dim: int) -> None:
     bit_width = 4
-    head_dim = 64
     batch_size = 5
     seq_len = 9
     codebook = Codebook(

@@ -178,7 +178,6 @@ def _value_kernel_batched(bit_width: int, head_dim: int) -> object:
     ), layout
 
 
-@lru_cache(maxsize=None)
 def _fused_decode_kernel(bit_width: int, head_dim: int) -> object:
     layout = PackedKVLayout(bit_width=bit_width, head_dim=head_dim)
     source = """

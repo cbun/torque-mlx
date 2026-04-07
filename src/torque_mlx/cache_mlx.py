@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Literal
 
 import numpy as np
@@ -25,7 +26,7 @@ from torque_mlx.quantization import (
     quantize,
     quantize_mlx,
 )
-from torque_mlx.rotation import RotationSpec
+from torque_mlx.rotation import RotationSpec, apply_structured_rotation_mlx, inverse_structured_rotation_mlx
 
 DecodeStrategy = Literal["auto", "split_batched", "fused_per_head"]
 SUPPORTED_DECODE_STRATEGIES: tuple[DecodeStrategy, ...] = (
@@ -46,6 +47,7 @@ class TorqueKVCacheMLX:
     growth_factor: int = 2
     decode_tail_capacity: int = 16
     decode_strategy: DecodeStrategy = "split_batched"
+    profile_decode_components: bool = False
     rotate_keys_on_append: bool = True
     rotate_values_on_append: bool = True
     rotate_queries_on_decode: bool = True
@@ -59,13 +61,15 @@ class TorqueKVCacheMLX:
     _value_centroids: Any = field(init=False, repr=False)
     _key_boundaries: Any = field(init=False, repr=False)
     _value_boundaries: Any = field(init=False, repr=False)
-    _rotation_apply_matrix: Any = field(init=False, repr=False)
-    _rotation_inverse_matrix: Any = field(init=False, repr=False)
+    _rotation_signs_left: Any = field(init=False, repr=False)
+    _rotation_signs_right: Any = field(init=False, repr=False)
     _use_append_pack_kernel: bool = field(init=False, repr=False)
+    _tail_storage_dtype: Any = field(init=False, repr=False)
     _tail_keys: Any = field(init=False, repr=False)
     _tail_values: Any = field(init=False, repr=False)
     _tail_length: int = field(init=False, repr=False)
     _query_index_cache: dict[int, tuple[Any, Any] | Any] = field(init=False, repr=False)
+    last_decode_profile: dict[str, float] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         import mlx.core as mx
@@ -106,15 +110,16 @@ class TorqueKVCacheMLX:
         self._value_centroids = mx.array(self.value_codebook.centroids)
         self._key_boundaries = mx.array(codebook_boundaries(self.key_codebook))
         self._value_boundaries = mx.array(codebook_boundaries(self.value_codebook))
-        rotation_matrix = self.rotation.matrix().astype(np.float32)
-        self._rotation_apply_matrix = mx.array(rotation_matrix.T)
-        self._rotation_inverse_matrix = mx.array(rotation_matrix)
+        self._rotation_signs_left = mx.array(self.rotation.signs_left.astype(np.float32))
+        self._rotation_signs_right = mx.array(self.rotation.signs_right.astype(np.float32))
         self._use_append_pack_kernel = metal_available()
+        self._tail_storage_dtype = mx.float16
         self._tail_length = 0
         self._query_index_cache = {}
+        self.last_decode_profile = {}
         self._tail_keys = mx.zeros(
             (self.config.num_layers, self.config.kv_heads, max(1, self.decode_tail_capacity), self.config.head_dim),
-            dtype=mx.float32,
+            dtype=self._tail_storage_dtype,
         )
         self._tail_values = mx.zeros_like(self._tail_keys)
 
@@ -167,6 +172,7 @@ class TorqueKVCacheMLX:
     def decode_mlx(self, *, query, return_numpy: bool = True):
         import mlx.core as mx
 
+        self.last_decode_profile = {}
         queries = self._normalize_query_heads_device(query, "query")
         if self.sequence_length == 0:
             zeros = mx.zeros((self.config.num_layers, int(queries.shape[1]), self.config.head_dim), dtype=mx.float32)
@@ -179,7 +185,11 @@ class TorqueKVCacheMLX:
             )
         kv_group_ratio = query_heads // self.config.kv_heads
         query_rot = (
-            queries @ self._rotation_apply_matrix
+            apply_structured_rotation_mlx(
+                queries,
+                signs_left=self._rotation_signs_left,
+                signs_right=self._rotation_signs_right,
+            )
             if self.rotate_queries_on_decode
             else queries
         )
@@ -214,9 +224,89 @@ class TorqueKVCacheMLX:
         if self.config.fused_weights:
             outputs = out_rot
         else:
-            outputs = out_rot @ self._rotation_inverse_matrix
+            outputs = inverse_structured_rotation_mlx(
+                out_rot,
+                signs_left=self._rotation_signs_left,
+                signs_right=self._rotation_signs_right,
+            )
         outputs = mx.reshape(outputs, (self.config.num_layers, query_heads, self.config.head_dim))
         return self._finalize_output(outputs, query_heads=query_heads, return_numpy=return_numpy)
+
+    def decode_mlx_with_current(self, *, query, key, value, return_numpy: bool = True):
+        import mlx.core as mx
+
+        self.last_decode_profile = {}
+        queries = self._normalize_query_heads_device(query, "query")
+        current_keys = self._normalize_layer_heads_sequence_device(key, "key")
+        current_values = self._normalize_layer_heads_sequence_device(value, "value")
+        if int(current_keys.shape[2]) != 1 or int(current_values.shape[2]) != 1:
+            raise ValueError("decode_mlx_with_current expects a single current token for key/value")
+
+        current_keys = self._quantize_rows(
+            self._apply_append_rotation(current_keys, rotate=self.rotate_keys_on_append),
+            centroids=self._key_centroids,
+            boundaries=self._key_boundaries,
+        )
+        current_values = self._quantize_rows(
+            self._apply_append_rotation(current_values, rotate=self.rotate_values_on_append),
+            centroids=self._value_centroids,
+            boundaries=self._value_boundaries,
+        )
+
+        query_heads = int(queries.shape[1])
+        if query_heads % self.config.kv_heads != 0:
+            raise ValueError(
+                f"query head count {query_heads} must be divisible by kv_heads {self.config.kv_heads}",
+            )
+        kv_group_ratio = query_heads // self.config.kv_heads
+        query_rot = (
+            apply_structured_rotation_mlx(
+                queries,
+                signs_left=self._rotation_signs_left,
+                signs_right=self._rotation_signs_right,
+            )
+            if self.rotate_queries_on_decode
+            else queries
+        )
+        query_rot_flat = mx.reshape(query_rot, (self.config.num_layers * query_heads, self.config.head_dim))
+        indices = self._grouped_query_indices(query_heads=query_heads, kv_group_ratio=kv_group_ratio)
+        if self.config.num_layers == 1:
+            kv_head_indices = indices
+            layer_indices = None
+            current_tail_keys = current_keys[0, kv_head_indices, :, :]
+            current_tail_values = current_values[0, kv_head_indices, :, :]
+        else:
+            layer_indices, kv_head_indices = indices
+            current_tail_keys = current_keys[layer_indices, kv_head_indices, :, :]
+            current_tail_values = current_values[layer_indices, kv_head_indices, :, :]
+
+        packed_length = self.sequence_length - self._tail_length
+        out_rot = self._decode_packed_and_tail_batch(
+            query_rot_flat=query_rot_flat,
+            layer_indices=layer_indices,
+            kv_head_indices=kv_head_indices,
+            packed_length=packed_length,
+            extra_tail_keys=current_tail_keys,
+            extra_tail_values=current_tail_values,
+        )
+        if self.config.fused_weights:
+            outputs = out_rot
+        else:
+            outputs = inverse_structured_rotation_mlx(
+                out_rot,
+                signs_left=self._rotation_signs_left,
+                signs_right=self._rotation_signs_right,
+            )
+        outputs = mx.reshape(outputs, (self.config.num_layers, query_heads, self.config.head_dim))
+        return self._finalize_output(outputs, query_heads=query_heads, return_numpy=return_numpy)
+
+    def _record_profile_timing(self, profile: dict[str, float] | None, key: str, start: float, *values) -> None:
+        if profile is None:
+            return
+        import mlx.core as mx
+
+        mx.eval(*values)
+        profile[key] = profile.get(key, 0.0) + (perf_counter() - start)
 
     def reset(self) -> None:
         import mlx.core as mx
@@ -280,6 +370,8 @@ class TorqueKVCacheMLX:
         self._capacity = new_capacity
 
     def _append_dense_tail(self, keys_rot, values_rot) -> None:
+        import mlx.core as mx
+
         quantized_keys = self._quantize_rows(
             keys_rot,
             centroids=self._key_centroids,
@@ -292,8 +384,12 @@ class TorqueKVCacheMLX:
         )
         if self._tail_length == self.decode_tail_capacity:
             self._flush_dense_tail()
-        self._tail_keys[:, :, self._tail_length, :] = quantized_keys[:, :, 0, :]
-        self._tail_values[:, :, self._tail_length, :] = quantized_values[:, :, 0, :]
+        self._tail_keys[:, :, self._tail_length, :] = quantized_keys[:, :, 0, :].astype(
+            self._tail_storage_dtype,
+        )
+        self._tail_values[:, :, self._tail_length, :] = quantized_values[:, :, 0, :].astype(
+            self._tail_storage_dtype,
+        )
         self._tail_length += 1
 
     def _append_packed_tokens(self, keys_rot, values_rot) -> None:
@@ -371,13 +467,17 @@ class TorqueKVCacheMLX:
     def _apply_append_rotation(self, values, *, rotate: bool):
         if not rotate:
             return values
-        return values @ self._rotation_apply_matrix
+        return apply_structured_rotation_mlx(
+            values,
+            signs_left=self._rotation_signs_left,
+            signs_right=self._rotation_signs_right,
+        )
 
     def _quantize_and_pack_rows(self, values, *, centroids, boundaries):
         import mlx.core as mx
 
         row_shape = tuple(int(dim) for dim in values.shape[:-1])
-        flat = mx.reshape(values, (-1, self.config.head_dim))
+        flat = mx.reshape(values.astype(mx.float32), (-1, self.config.head_dim))
         if self._use_append_pack_kernel:
             packed = quantize_and_pack_rows_metal(
                 flat,
@@ -404,8 +504,8 @@ class TorqueKVCacheMLX:
         import mlx.core as mx
 
         row_shape = tuple(int(dim) for dim in key_values.shape[:-1])
-        flat_keys = mx.reshape(key_values, (-1, self.config.head_dim))
-        flat_values = mx.reshape(value_values, (-1, self.config.head_dim))
+        flat_keys = mx.reshape(key_values.astype(mx.float32), (-1, self.config.head_dim))
+        flat_values = mx.reshape(value_values.astype(mx.float32), (-1, self.config.head_dim))
         packed_keys, packed_values = quantize_and_pack_rows_dual_metal(
             flat_keys,
             flat_values,
@@ -419,21 +519,119 @@ class TorqueKVCacheMLX:
             mx.reshape(packed_values, (*row_shape, self._layout.packed_words)),
         )
 
-    def _decode_packed_and_tail_batch(self, *, query_rot_flat, layer_indices, kv_head_indices, packed_length: int):
+    def _decode_packed_and_tail_batch(
+        self,
+        *,
+        query_rot_flat,
+        layer_indices,
+        kv_head_indices,
+        packed_length: int,
+        extra_tail_keys=None,
+        extra_tail_values=None,
+    ):
         import mlx.core as mx
 
+        profile = self.last_decode_profile if self.profile_decode_components else None
         scale = 1.0 / np.sqrt(self.config.head_dim)
-        if self.config.num_layers == 1:
-            tail_keys = self._tail_keys[0, kv_head_indices, : self._tail_length, :]
-            tail_values = self._tail_values[0, kv_head_indices, : self._tail_length, :]
+        tail_mask = None
+        if self._tail_length > 0:
+            if self.config.num_layers == 1:
+                tail_keys = self._tail_keys[0, kv_head_indices, : self._tail_length, :]
+                tail_values = self._tail_values[0, kv_head_indices, : self._tail_length, :]
+            else:
+                tail_keys = self._tail_keys[layer_indices, kv_head_indices, : self._tail_length, :]
+                tail_values = self._tail_values[layer_indices, kv_head_indices, : self._tail_length, :]
         else:
-            tail_keys = self._tail_keys[layer_indices, kv_head_indices, : self._tail_length, :]
-            tail_values = self._tail_values[layer_indices, kv_head_indices, : self._tail_length, :]
-        tail_scores = mx.sum(tail_keys * mx.expand_dims(query_rot_flat, axis=1), axis=-1)
+            tail_keys = None
+            tail_values = None
+        if extra_tail_keys is not None:
+            tail_keys = extra_tail_keys if tail_keys is None else mx.concatenate([tail_keys, extra_tail_keys], axis=1)
+            tail_values = extra_tail_values if tail_values is None else mx.concatenate([tail_values, extra_tail_values], axis=1)
+
+        if tail_keys is None or tail_values is None:
+            if self.config.num_layers == 1:
+                batched_k_codes = self._key_codes[0, kv_head_indices, :packed_length, :]
+                batched_v_codes = self._value_codes[0, kv_head_indices, :packed_length, :]
+            else:
+                batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
+                batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
+            return self._decode_packed_batch(
+                query_rot_flat=query_rot_flat,
+                batched_k_codes=batched_k_codes,
+                batched_v_codes=batched_v_codes,
+            )
+
+        tail_token_count = int(tail_keys.shape[1])
+        if tail_token_count == 1:
+            tail_started = perf_counter() if profile is not None else 0.0
+            tail_scores = mx.sum(
+                tail_keys[:, 0, :].astype(mx.float32) * query_rot_flat,
+                axis=1,
+                keepdims=True,
+            )
+            self._record_profile_timing(profile, "tail_seconds", tail_started, tail_scores)
+
+            if packed_length == 0:
+                softmax_started = perf_counter() if profile is not None else 0.0
+                tail_weights = mx.softmax(tail_scores * scale, axis=1)
+                self._record_profile_timing(profile, "softmax_seconds", softmax_started, tail_weights)
+                tail_started = perf_counter() if profile is not None else 0.0
+                tail_out = tail_values[:, 0, :].astype(mx.float32) * tail_weights
+                self._record_profile_timing(profile, "tail_seconds", tail_started, tail_out)
+                return tail_out
+
+            if self.config.num_layers == 1:
+                batched_k_codes = self._key_codes[0, kv_head_indices, :packed_length, :]
+                batched_v_codes = self._value_codes[0, kv_head_indices, :packed_length, :]
+            else:
+                batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
+                batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
+            score_started = perf_counter() if profile is not None else 0.0
+            packed_scores = score_packed_query_batched(
+                query_rot_flat,
+                batched_k_codes,
+                self._key_centroids,
+                bit_width=self.config.bit_width,
+                head_dim=self.config.head_dim,
+            )
+            self._record_profile_timing(profile, "packed_score_seconds", score_started, packed_scores)
+            softmax_started = perf_counter() if profile is not None else 0.0
+            all_scores = mx.concatenate([packed_scores, tail_scores], axis=1)
+            all_weights = mx.softmax(all_scores * scale, axis=1)
+            self._record_profile_timing(profile, "softmax_seconds", softmax_started, all_weights)
+            value_started = perf_counter() if profile is not None else 0.0
+            packed_out = accumulate_packed_values_batched(
+                all_weights[:, :packed_length],
+                batched_v_codes,
+                self._value_centroids,
+                bit_width=self.config.bit_width,
+                head_dim=self.config.head_dim,
+            )
+            self._record_profile_timing(profile, "packed_value_seconds", value_started, packed_out)
+            tail_started = perf_counter() if profile is not None else 0.0
+            tail_out = tail_values[:, 0, :].astype(mx.float32) * all_weights[:, packed_length : packed_length + 1]
+            self._record_profile_timing(profile, "tail_seconds", tail_started, tail_out)
+            return packed_out + tail_out
+
+        tail_query = mx.expand_dims(query_rot_flat.astype(self._tail_storage_dtype), axis=-1)
+        tail_started = perf_counter() if profile is not None else 0.0
+        tail_scores = mx.squeeze(mx.matmul(tail_keys, tail_query), axis=-1).astype(mx.float32)
+        self._record_profile_timing(profile, "tail_seconds", tail_started, tail_scores)
 
         if packed_length == 0:
+            softmax_started = perf_counter() if profile is not None else 0.0
             tail_weights = mx.softmax(tail_scores * scale, axis=1)
-            return mx.sum(mx.expand_dims(tail_weights, axis=-1) * tail_values, axis=1)
+            self._record_profile_timing(profile, "softmax_seconds", softmax_started, tail_weights)
+            tail_started = perf_counter() if profile is not None else 0.0
+            tail_out = mx.squeeze(
+                mx.matmul(
+                    mx.expand_dims(tail_weights.astype(self._tail_storage_dtype), axis=1),
+                    tail_values,
+                ),
+                axis=1,
+            ).astype(mx.float32)
+            self._record_profile_timing(profile, "tail_seconds", tail_started, tail_out)
+            return tail_out
 
         if self.config.num_layers == 1:
             batched_k_codes = self._key_codes[0, kv_head_indices, :packed_length, :]
@@ -441,6 +639,7 @@ class TorqueKVCacheMLX:
         else:
             batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
             batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
+        score_started = perf_counter() if profile is not None else 0.0
         packed_scores = score_packed_query_batched(
             query_rot_flat,
             batched_k_codes,
@@ -448,8 +647,12 @@ class TorqueKVCacheMLX:
             bit_width=self.config.bit_width,
             head_dim=self.config.head_dim,
         )
+        self._record_profile_timing(profile, "packed_score_seconds", score_started, packed_scores)
+        softmax_started = perf_counter() if profile is not None else 0.0
         all_scores = mx.concatenate([packed_scores, tail_scores], axis=1)
         all_weights = mx.softmax(all_scores * scale, axis=1)
+        self._record_profile_timing(profile, "softmax_seconds", softmax_started, all_weights)
+        value_started = perf_counter() if profile is not None else 0.0
         packed_out = accumulate_packed_values_batched(
             all_weights[:, :packed_length],
             batched_v_codes,
@@ -457,10 +660,19 @@ class TorqueKVCacheMLX:
             bit_width=self.config.bit_width,
             head_dim=self.config.head_dim,
         )
-        tail_out = mx.sum(
-            mx.expand_dims(all_weights[:, packed_length:], axis=-1) * tail_values,
+        self._record_profile_timing(profile, "packed_value_seconds", value_started, packed_out)
+        tail_started = perf_counter() if profile is not None else 0.0
+        tail_out = mx.squeeze(
+            mx.matmul(
+                mx.expand_dims(
+                    all_weights[:, packed_length:].astype(self._tail_storage_dtype),
+                    axis=1,
+                ),
+                tail_values,
+            ),
             axis=1,
-        )
+        ).astype(mx.float32)
+        self._record_profile_timing(profile, "tail_seconds", tail_started, tail_out)
         return packed_out + tail_out
 
     def _grouped_query_indices(self, *, query_heads: int, kv_group_ratio: int):
@@ -508,6 +720,31 @@ class TorqueKVCacheMLX:
         import mlx.core as mx
 
         strategy = self.resolve_decode_strategy()
+        profile = self.last_decode_profile if self.profile_decode_components else None
+        if strategy == "split_batched" and profile is not None:
+            scale = 1.0 / np.sqrt(self.config.head_dim)
+            score_started = perf_counter()
+            scores = score_packed_query_batched(
+                query_rot_flat,
+                batched_k_codes,
+                self._key_centroids,
+                bit_width=self.config.bit_width,
+                head_dim=self.config.head_dim,
+            )
+            self._record_profile_timing(profile, "packed_score_seconds", score_started, scores)
+            softmax_started = perf_counter()
+            weights = mx.softmax(scores * scale, axis=1)
+            self._record_profile_timing(profile, "softmax_seconds", softmax_started, weights)
+            value_started = perf_counter()
+            out = accumulate_packed_values_batched(
+                weights,
+                batched_v_codes,
+                self._value_centroids,
+                bit_width=self.config.bit_width,
+                head_dim=self.config.head_dim,
+            )
+            self._record_profile_timing(profile, "packed_value_seconds", value_started, out)
+            return out
         if strategy == "split_batched":
             return decode_packed_attention_split_batched(
                 query_rot_flat,

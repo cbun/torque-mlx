@@ -12,7 +12,74 @@ import numpy as np
 from torque_mlx.cache_mlx import TorqueKVCacheMLX
 from torque_mlx.config import TorqueConfig
 from torque_mlx.families.qwen import QWEN_MODEL_MANIFEST_FILE, load_qwen_model_manifest
-from torque_mlx.rotation import RotationSpec
+from torque_mlx.layout import PackedKVLayout
+from torque_mlx.rotation import RotationSpec, inverse_structured_rotation_mlx
+
+DEFAULT_QWEN_DECODE_TAIL_CAPACITY = 8
+DEFAULT_QWEN_LARGE_MODEL_DECODE_TAIL_CAPACITY = 0
+QWEN_SMALL_MODEL_HIDDEN_SIZE_THRESHOLD = 2048
+
+
+def resolve_qwen_decode_tail_capacity(*, hidden_size: int | None, requested: int | None) -> int:
+    if requested is not None:
+        return requested
+    if hidden_size is None:
+        return DEFAULT_QWEN_DECODE_TAIL_CAPACITY
+    if hidden_size < QWEN_SMALL_MODEL_HIDDEN_SIZE_THRESHOLD:
+        return DEFAULT_QWEN_DECODE_TAIL_CAPACITY
+    return DEFAULT_QWEN_LARGE_MODEL_DECODE_TAIL_CAPACITY
+
+
+def _qwen_hidden_size_from_config(config: Mapping[str, object]) -> int | None:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, Mapping):
+        return None
+    hidden_size = text_config.get("hidden_size")
+    return int(hidden_size) if hidden_size is not None else None
+
+
+def _qwen_full_attention_layer_count(config: Mapping[str, object]) -> int:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, Mapping):
+        return 0
+    layer_types = text_config.get("layer_types")
+    if not isinstance(layer_types, list):
+        return 0
+    return sum(1 for layer_type in layer_types if layer_type == "full_attention")
+
+
+def _estimate_qwen_full_attention_kv_bytes(
+    *,
+    config: Mapping[str, object],
+    manifest,
+    kv_cache_tokens: int,
+) -> tuple[int, int | None, int | None, int]:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, Mapping):
+        return 0, None, None, 0
+
+    head_dim = int(text_config["head_dim"])
+    kv_heads = int(text_config["num_key_value_heads"])
+    full_attention_layers = (
+        len(manifest.converted_layer_indices)
+        if manifest is not None
+        else _qwen_full_attention_layer_count(config)
+    )
+    fp16_bytes = kv_cache_tokens * full_attention_layers * kv_heads * head_dim * 2 * 2
+    if manifest is None:
+        return fp16_bytes, None, None, full_attention_layers
+
+    layout = PackedKVLayout(
+        bit_width=manifest.runtime_config.bit_width,
+        head_dim=manifest.runtime_config.head_dim,
+    )
+    packed_bytes = (
+        kv_cache_tokens
+        * full_attention_layers
+        * manifest.runtime_config.kv_heads
+        * layout.kv_bytes_per_token_per_head
+    )
+    return fp16_bytes, packed_bytes, fp16_bytes - packed_bytes, full_attention_layers
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +99,10 @@ class QwenMLXRuntimeProfile:
     torque_decode_seconds: float = 0.0
     torque_decode_calls: int = 0
     torque_decode_tokens: int = 0
+    torque_score_seconds: float = 0.0
+    torque_softmax_seconds: float = 0.0
+    torque_value_seconds: float = 0.0
+    torque_tail_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -50,6 +121,10 @@ class QwenMLXRuntimeProfile:
             "torque_decode_seconds": self.torque_decode_seconds,
             "torque_decode_calls": self.torque_decode_calls,
             "torque_decode_tokens": self.torque_decode_tokens,
+            "torque_score_seconds": self.torque_score_seconds,
+            "torque_softmax_seconds": self.torque_softmax_seconds,
+            "torque_value_seconds": self.torque_value_seconds,
+            "torque_tail_seconds": self.torque_tail_seconds,
         }
 
 
@@ -59,12 +134,19 @@ class QwenMLXGenerationResult:
     prompt: str
     max_tokens: int
     prefill_step_size: int
+    decode_tail_capacity: int
+    ignore_eos: bool
     generated_text: str
     prompt_tokens: int
     prompt_tokens_per_second: float
     generation_tokens: int
     generation_tokens_per_second: float
     peak_memory_gb: float
+    kv_cache_tokens: int
+    full_attention_layer_count: int
+    full_attention_kv_fp16_bytes_estimate: int
+    full_attention_kv_packed_bytes_estimate: int | None
+    full_attention_kv_bytes_saved_estimate: int | None
     is_torque_converted: bool
     artifact_layout: str | None
     converted_layer_indices: tuple[int, ...]
@@ -80,12 +162,19 @@ class QwenMLXGenerationResult:
             "prompt": self.prompt,
             "max_tokens": self.max_tokens,
             "prefill_step_size": self.prefill_step_size,
+            "decode_tail_capacity": self.decode_tail_capacity,
+            "ignore_eos": self.ignore_eos,
             "generated_text": self.generated_text,
             "prompt_tokens": self.prompt_tokens,
             "prompt_tokens_per_second": self.prompt_tokens_per_second,
             "generation_tokens": self.generation_tokens,
             "generation_tokens_per_second": self.generation_tokens_per_second,
             "peak_memory_gb": self.peak_memory_gb,
+            "kv_cache_tokens": self.kv_cache_tokens,
+            "full_attention_layer_count": self.full_attention_layer_count,
+            "full_attention_kv_fp16_bytes_estimate": self.full_attention_kv_fp16_bytes_estimate,
+            "full_attention_kv_packed_bytes_estimate": self.full_attention_kv_packed_bytes_estimate,
+            "full_attention_kv_bytes_saved_estimate": self.full_attention_kv_bytes_saved_estimate,
             "is_torque_converted": self.is_torque_converted,
             "artifact_layout": self.artifact_layout,
             "converted_layer_indices": list(self.converted_layer_indices),
@@ -114,6 +203,10 @@ class _QwenMLXRuntimeProfiler:
     torque_decode_seconds: float = 0.0
     torque_decode_calls: int = 0
     torque_decode_tokens: int = 0
+    torque_score_seconds: float = 0.0
+    torque_softmax_seconds: float = 0.0
+    torque_value_seconds: float = 0.0
+    torque_tail_seconds: float = 0.0
 
     def record_dense_prefill(self, *, seconds: float, tokens: int) -> None:
         self.dense_prefill_seconds += seconds
@@ -136,10 +229,15 @@ class _QwenMLXRuntimeProfiler:
         self.torque_append_calls += 1
         self.torque_append_tokens += tokens
 
-    def record_torque_decode(self, *, seconds: float, tokens: int) -> None:
+    def record_torque_decode(self, *, seconds: float, tokens: int, components: Mapping[str, float] | None = None) -> None:
         self.torque_decode_seconds += seconds
         self.torque_decode_calls += 1
         self.torque_decode_tokens += tokens
+        if components is not None:
+            self.torque_score_seconds += float(components.get("packed_score_seconds", 0.0))
+            self.torque_softmax_seconds += float(components.get("softmax_seconds", 0.0))
+            self.torque_value_seconds += float(components.get("packed_value_seconds", 0.0))
+            self.torque_tail_seconds += float(components.get("tail_seconds", 0.0))
 
     def freeze(self) -> QwenMLXRuntimeProfile:
         return QwenMLXRuntimeProfile(
@@ -158,6 +256,10 @@ class _QwenMLXRuntimeProfiler:
             torque_decode_seconds=self.torque_decode_seconds,
             torque_decode_calls=self.torque_decode_calls,
             torque_decode_tokens=self.torque_decode_tokens,
+            torque_score_seconds=self.torque_score_seconds,
+            torque_softmax_seconds=self.torque_softmax_seconds,
+            torque_value_seconds=self.torque_value_seconds,
+            torque_tail_seconds=self.torque_tail_seconds,
         )
 
 
@@ -266,6 +368,26 @@ def _sanitize_qwen3_5_weights(
         sanitized[key] = transformed
 
     return sanitized
+
+
+def _resolve_qwen_weight_target(model, weight_name: str):
+    target = model
+    for part in weight_name.split("."):
+        if part.isdigit():
+            target = target[int(part)]
+            continue
+        target = getattr(target, part)
+    return target
+
+
+def _cast_qwen_weights_to_model_dtypes(model, weights: Mapping[str, Any], *, mx) -> list[tuple[str, Any]]:
+    cast_weights: list[tuple[str, Any]] = []
+    for name, value in weights.items():
+        target = _resolve_qwen_weight_target(model, name)
+        target_dtype = getattr(target, "dtype", None)
+        array = value if target_dtype is None or value.dtype == target_dtype else value.astype(target_dtype)
+        cast_weights.append((name, array))
+    return cast_weights
 
 
 def _build_qwen3_5_mlx_model(config: Mapping[str, object]):
@@ -410,7 +532,11 @@ def _apply_qwen_mlx_delta_overrides(model, artifact_dir: str | Path, manifest) -
     mx = runtime.mx
 
     overrides = _load_qwen_mlx_delta_overrides(artifact_dir, manifest)
-    weights = [(name, mx.array(values)) for name, values in overrides.items()]
+    weights = _cast_qwen_weights_to_model_dtypes(
+        model,
+        {name: mx.array(values) for name, values in overrides.items()},
+        mx=mx,
+    )
     model.load_weights(weights, strict=False)
     mx.eval(model.parameters())
 
@@ -426,13 +552,14 @@ def _restore_stacked_input_projection_mlx(weight, *, head_dim: int, num_blocks: 
     return restored.reshape(weight.shape)
 
 
-def _runtime_unrotate_attention_output_mlx(attn_output, *, rotation_matrix):
-    runtime = _load_mlx_qwen_runtime()
-    mx = runtime.mx
-
+def _runtime_unrotate_attention_output_mlx(attn_output, *, signs_left, signs_right):
     head_dim = int(attn_output.shape[-1])
     flat = attn_output.reshape(-1, head_dim)
-    unrotated = flat @ rotation_matrix.astype(attn_output.dtype)
+    unrotated = inverse_structured_rotation_mlx(
+        flat,
+        signs_left=signs_left,
+        signs_right=signs_right,
+    )
     return unrotated.reshape(attn_output.shape)
 
 
@@ -510,11 +637,42 @@ class QwenTorqueFullAttentionCacheMLX:
             self.profiler.record_torque_decode(
                 seconds=perf_counter() - start,
                 tokens=int(queries.shape[2]),
+                components=self.torque_cache.last_decode_profile,
+            )
+        return mx.reshape(output, (1, int(queries.shape[1]), 1, int(queries.shape[3])))
+
+    def decode_token_with_current(self, queries, keys, values):
+        runtime = _load_mlx_qwen_runtime()
+        mx = runtime.mx
+
+        if int(queries.shape[0]) != 1 or int(queries.shape[2]) != 1:
+            raise ValueError("Torque MLX Qwen decode currently supports batch size 1 and q_len=1")
+        if int(keys.shape[0]) != 1 or int(keys.shape[2]) != 1 or int(values.shape[0]) != 1 or int(values.shape[2]) != 1:
+            raise ValueError("Torque MLX Qwen decode currently expects single-token key/value updates")
+        self.dense_cache = None
+        start = perf_counter() if self.profiler is not None else None
+        output = self.torque_cache.decode_mlx_with_current(
+            query=queries[0, :, 0, :],
+            key=keys[0],
+            value=values[0],
+            return_numpy=False,
+        )
+        if self.profiler is not None and start is not None:
+            mx.eval(output)
+            self.profiler.record_torque_decode(
+                seconds=perf_counter() - start,
+                tokens=int(queries.shape[2]),
+                components=self.torque_cache.last_decode_profile,
             )
         return mx.reshape(output, (1, int(queries.shape[1]), 1, int(queries.shape[3])))
 
 
-def _build_qwen_torque_cache(manifest, *, profiler: _QwenMLXRuntimeProfiler | None = None) -> QwenTorqueFullAttentionCacheMLX:
+def _build_qwen_torque_cache(
+    manifest,
+    *,
+    profiler: _QwenMLXRuntimeProfiler | None = None,
+    decode_tail_capacity: int = DEFAULT_QWEN_DECODE_TAIL_CAPACITY,
+) -> QwenTorqueFullAttentionCacheMLX:
     config = TorqueConfig(
         bit_width=manifest.runtime_config.bit_width,
         head_dim=manifest.runtime_config.head_dim,
@@ -529,6 +687,8 @@ def _build_qwen_torque_cache(manifest, *, profiler: _QwenMLXRuntimeProfiler | No
             config=config,
             key_codebook=manifest.key_codebook,
             value_codebook=manifest.value_codebook,
+            decode_tail_capacity=decode_tail_capacity,
+            profile_decode_components=profiler is not None,
             rotate_keys_on_append=True,
             rotate_values_on_append=False,
             rotate_queries_on_decode=True,
@@ -537,7 +697,15 @@ def _build_qwen_torque_cache(manifest, *, profiler: _QwenMLXRuntimeProfiler | No
     )
 
 
-def _patch_vo_only_qwen_attention_mlx(layer, *, rotation_matrix, manifest, profiler: _QwenMLXRuntimeProfiler | None = None) -> None:
+def _patch_vo_only_qwen_attention_mlx(
+    layer,
+    *,
+    rotation_matrix,
+    rotation_signs_left,
+    rotation_signs_right,
+    manifest,
+    profiler: _QwenMLXRuntimeProfiler | None = None,
+) -> None:
     runtime = _load_mlx_qwen_runtime()
     mx = runtime.mx
     nn = runtime.nn
@@ -555,7 +723,8 @@ def _patch_vo_only_qwen_attention_mlx(layer, *, rotation_matrix, manifest, profi
         def __init__(self, base_attn):
             super().__init__()
             self.base_attn = base_attn
-            self.rotation_matrix = rotation_matrix.astype(mx.float32)
+            self.rotation_signs_left = rotation_signs_left.astype(mx.float32)
+            self.rotation_signs_right = rotation_signs_right.astype(mx.float32)
             self.profiler = profiler
 
         def __call__(self, x, mask=None, cache=None):
@@ -589,8 +758,8 @@ def _patch_vo_only_qwen_attention_mlx(layer, *, rotation_matrix, manifest, profi
 
             if cache is not None and isinstance(cache, QwenTorqueFullAttentionCacheMLX):
                 if L == 1:
+                    output = cache.decode_token_with_current(queries, keys, values)
                     cache.append_decode_tokens(keys, values)
-                    output = cache.decode_token(queries)
                 else:
                     dense_start = perf_counter() if self.profiler is not None else None
                     dense_keys, dense_values = cache.update_dense_and_fetch(keys, values)
@@ -619,15 +788,23 @@ def _patch_vo_only_qwen_attention_mlx(layer, *, rotation_matrix, manifest, profi
 
             output = _runtime_unrotate_attention_output_mlx(
                 output,
-                rotation_matrix=self.rotation_matrix,
+                signs_left=self.rotation_signs_left,
+                signs_right=self.rotation_signs_right,
             )
             output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return self.base_attn.o_proj(output * mx.sigmoid(gate))
+            projected = (output * mx.sigmoid(gate)).astype(self.base_attn.o_proj.weight.dtype)
+            return self.base_attn.o_proj(projected)
 
     layer.self_attn = _TorqueAttentionAdapter(attention)
 
 
-def _patch_qwen_mlx_make_cache(model, manifest, *, profiler: _QwenMLXRuntimeProfiler | None = None) -> None:
+def _patch_qwen_mlx_make_cache(
+    model,
+    manifest,
+    *,
+    profiler: _QwenMLXRuntimeProfiler | None = None,
+    decode_tail_capacity: int = DEFAULT_QWEN_DECODE_TAIL_CAPACITY,
+) -> None:
     runtime = _load_mlx_qwen_runtime()
 
     converted = set(int(idx) for idx in manifest.converted_layer_indices)
@@ -639,7 +816,13 @@ def _patch_qwen_mlx_make_cache(model, manifest, *, profiler: _QwenMLXRuntimeProf
                 caches.append(runtime.MambaCache())
                 continue
             if layer_idx in converted:
-                caches.append(_build_qwen_torque_cache(manifest, profiler=profiler))
+                caches.append(
+                    _build_qwen_torque_cache(
+                        manifest,
+                        profiler=profiler,
+                        decode_tail_capacity=decode_tail_capacity,
+                    ),
+                )
                 continue
             caches.append(runtime.KVCache())
         return caches
@@ -647,7 +830,13 @@ def _patch_qwen_mlx_make_cache(model, manifest, *, profiler: _QwenMLXRuntimeProf
     model.make_cache = MethodType(_make_cache, model)
 
 
-def _patch_qwen_mlx_runtime(model, manifest, *, profiler: _QwenMLXRuntimeProfiler | None = None) -> None:
+def _patch_qwen_mlx_runtime(
+    model,
+    manifest,
+    *,
+    profiler: _QwenMLXRuntimeProfiler | None = None,
+    decode_tail_capacity: int = DEFAULT_QWEN_DECODE_TAIL_CAPACITY,
+) -> None:
     runtime = _load_mlx_qwen_runtime()
     mx = runtime.mx
 
@@ -656,8 +845,15 @@ def _patch_qwen_mlx_runtime(model, manifest, *, profiler: _QwenMLXRuntimeProfile
         seed=manifest.runtime_config.rotation_seed,
     )
     rotation_matrix = mx.array(rotation.matrix().astype(np.float32))
+    rotation_signs_left = mx.array(rotation.signs_left.astype(np.float32))
+    rotation_signs_right = mx.array(rotation.signs_right.astype(np.float32))
 
-    _patch_qwen_mlx_make_cache(model, manifest, profiler=profiler)
+    _patch_qwen_mlx_make_cache(
+        model,
+        manifest,
+        profiler=profiler,
+        decode_tail_capacity=decode_tail_capacity,
+    )
     for layer_idx_str, mode in manifest.layer_fusion_modes.items():
         if mode != "vo_only_runtime_qk_rotation":
             raise ValueError(f"Unsupported MLX Qwen torque fusion mode: {mode}")
@@ -665,6 +861,8 @@ def _patch_qwen_mlx_runtime(model, manifest, *, profiler: _QwenMLXRuntimeProfile
         _patch_vo_only_qwen_attention_mlx(
             layer,
             rotation_matrix=rotation_matrix,
+            rotation_signs_left=rotation_signs_left,
+            rotation_signs_right=rotation_signs_right,
             manifest=manifest,
             profiler=profiler,
         )
@@ -675,6 +873,7 @@ def load_mlx_qwen_model(
     model_dir: str | Path,
     lazy: bool = False,
     profile_runtime: bool = False,
+    decode_tail_capacity: int | None = None,
 ):
     model_path = Path(model_dir)
     manifest = load_qwen_model_manifest(model_path) if (model_path / QWEN_MODEL_MANIFEST_FILE).exists() else None
@@ -690,11 +889,20 @@ def load_mlx_qwen_model(
         tokenizer_dir=tokenizer_path,
         lazy=lazy,
     )
+    resolved_decode_tail_capacity = resolve_qwen_decode_tail_capacity(
+        hidden_size=_qwen_hidden_size_from_config(config),
+        requested=decode_tail_capacity,
+    )
     profiler = _QwenMLXRuntimeProfiler() if (manifest is not None and profile_runtime) else None
     if manifest is not None and manifest.artifact_layout == "delta_npz":
         _apply_qwen_mlx_delta_overrides(model, model_path, manifest)
     if manifest is not None:
-        _patch_qwen_mlx_runtime(model, manifest, profiler=profiler)
+        _patch_qwen_mlx_runtime(
+            model,
+            manifest,
+            profiler=profiler,
+            decode_tail_capacity=resolved_decode_tail_capacity,
+        )
     return model, tokenizer, config, manifest, profiler
 
 
@@ -705,6 +913,8 @@ def benchmark_qwen_mlx_generation(
     max_tokens: int = 64,
     prefill_step_size: int = 512,
     profile_runtime: bool = False,
+    decode_tail_capacity: int | None = None,
+    ignore_eos: bool = False,
 ) -> QwenMLXGenerationResult:
     try:
         import mlx.core as mx
@@ -714,22 +924,34 @@ def benchmark_qwen_mlx_generation(
             "Qwen MLX generation requires the optional mlx and mlx-lm runtime dependencies.",
         ) from exc
 
-    model, tokenizer, _, manifest, profiler = load_mlx_qwen_model(
+    model, tokenizer, config, manifest, profiler = load_mlx_qwen_model(
         model_dir=model_dir,
         profile_runtime=profile_runtime,
+        decode_tail_capacity=decode_tail_capacity,
+    )
+    resolved_decode_tail_capacity = resolve_qwen_decode_tail_capacity(
+        hidden_size=_qwen_hidden_size_from_config(config),
+        requested=decode_tail_capacity,
     )
 
     generated = ""
     last_response = None
-    for response in stream_generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=max_tokens,
-        prefill_step_size=prefill_step_size,
-    ):
-        generated += response.text
-        last_response = response
+    original_eos_token_ids = tuple(tokenizer.eos_token_ids)
+    if ignore_eos:
+        tokenizer.eos_token_ids = ()
+    try:
+        for response in stream_generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=max_tokens,
+            prefill_step_size=prefill_step_size,
+        ):
+            generated += response.text
+            last_response = response
+    finally:
+        if ignore_eos:
+            tokenizer.eos_token_ids = original_eos_token_ids
     if last_response is None:
         raise RuntimeError("MLX generation produced no responses")
 
@@ -744,17 +966,35 @@ def benchmark_qwen_mlx_generation(
         if float(last_response.generation_tps) > 0.0
         else None
     )
+    kv_cache_tokens = int(last_response.prompt_tokens) + int(last_response.generation_tokens)
+    (
+        full_attention_kv_fp16_bytes_estimate,
+        full_attention_kv_packed_bytes_estimate,
+        full_attention_kv_bytes_saved_estimate,
+        full_attention_layer_count,
+    ) = _estimate_qwen_full_attention_kv_bytes(
+        config=config,
+        manifest=manifest,
+        kv_cache_tokens=kv_cache_tokens,
+    )
     return QwenMLXGenerationResult(
         model_dir=str(Path(model_dir).resolve()),
         prompt=prompt,
         max_tokens=max_tokens,
         prefill_step_size=prefill_step_size,
+        decode_tail_capacity=resolved_decode_tail_capacity,
+        ignore_eos=ignore_eos,
         generated_text=generated,
         prompt_tokens=int(last_response.prompt_tokens),
         prompt_tokens_per_second=float(last_response.prompt_tps),
         generation_tokens=int(last_response.generation_tokens),
         generation_tokens_per_second=float(last_response.generation_tps),
         peak_memory_gb=float(last_response.peak_memory),
+        kv_cache_tokens=kv_cache_tokens,
+        full_attention_layer_count=full_attention_layer_count,
+        full_attention_kv_fp16_bytes_estimate=full_attention_kv_fp16_bytes_estimate,
+        full_attention_kv_packed_bytes_estimate=full_attention_kv_packed_bytes_estimate,
+        full_attention_kv_bytes_saved_estimate=full_attention_kv_bytes_saved_estimate,
         is_torque_converted=manifest is not None,
         artifact_layout=manifest.artifact_layout if manifest is not None else None,
         converted_layer_indices=tuple(manifest.converted_layer_indices) if manifest is not None else (),

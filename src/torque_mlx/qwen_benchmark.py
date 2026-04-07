@@ -17,6 +17,7 @@ from torque_mlx.families.qwen import (
 )
 from torque_mlx.mlx_ops import metal_available
 from torque_mlx.quantization import kv_bytes_per_token
+from torque_mlx.qwen_mlx import resolve_qwen_decode_tail_capacity
 
 
 def _fp16_kv_bytes_per_token(*, head_dim: int, kv_heads: int) -> int:
@@ -38,6 +39,7 @@ class QwenDecodeBenchmarkProfile:
     profile_source: str
     model_type: str
     text_model_type: str | None
+    hidden_size: int | None
     head_dim: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -79,6 +81,7 @@ class QwenDecodeBenchmarkProfile:
             "profile_source": self.profile_source,
             "model_type": self.model_type,
             "text_model_type": self.text_model_type,
+            "hidden_size": self.hidden_size,
             "head_dim": self.head_dim,
             "num_hidden_layers": self.num_hidden_layers,
             "num_attention_heads": self.num_attention_heads,
@@ -105,6 +108,7 @@ class QwenDecodeRuntimeBenchmarkResult:
     decode_steps: int
     seed: int
     torque_decode_strategy: str
+    torque_decode_tail_capacity: int
     fp16_update_seconds: float
     fp16_attention_seconds: float
     fp16_decode_seconds: float
@@ -137,6 +141,7 @@ class QwenDecodeRuntimeBenchmarkResult:
             "decode_steps": self.decode_steps,
             "seed": self.seed,
             "torque_decode_strategy": self.torque_decode_strategy,
+            "torque_decode_tail_capacity": self.torque_decode_tail_capacity,
             "notes": [
                 "This benchmark measures the KV-growing decode hot path only, not full dense forwards or perplexity.",
                 "It uses the Qwen model geometry from the local snapshot or torque manifest.",
@@ -187,6 +192,7 @@ def load_qwen_decode_benchmark_profile(
             profile_source="torque_manifest",
             model_type=manifest.source_model_type,
             text_model_type=manifest.source_text_model_type,
+            hidden_size=source_report.hidden_size if source_report is not None else None,
             head_dim=manifest.runtime_config.head_dim,
             num_hidden_layers=manifest.runtime_config.num_layers,
             num_attention_heads=(
@@ -214,6 +220,7 @@ def load_qwen_decode_benchmark_profile(
         profile_source="hf_snapshot",
         model_type=report.model_type,
         text_model_type=report.text_model_type,
+        hidden_size=report.hidden_size,
         head_dim=report.head_dim,
         num_hidden_layers=report.num_hidden_layers,
         num_attention_heads=report.num_attention_heads,
@@ -260,6 +267,7 @@ def _run_qwen_decode_runtime_benchmark_impl(
     decode_steps: int,
     seed: int,
     decode_strategy: str,
+    decode_tail_capacity: int,
 ) -> QwenDecodeRuntimeBenchmarkResult:
     if not metal_available():
         raise RuntimeError("Metal toolchain unavailable for benchmark")
@@ -312,6 +320,7 @@ def _run_qwen_decode_runtime_benchmark_impl(
         value_codebook=build_uniform_codebook(profile.bit_width),
         initial_capacity=prefill_tokens + decode_steps,
         decode_strategy=decode_strategy,
+        decode_tail_capacity=decode_tail_capacity,
     )
     for token_idx in range(prefill_tokens):
         torque_cache.append(
@@ -393,6 +402,7 @@ def _run_qwen_decode_runtime_benchmark_impl(
         decode_steps=decode_steps,
         seed=seed,
         torque_decode_strategy=decode_strategy,
+        torque_decode_tail_capacity=decode_tail_capacity,
         fp16_update_seconds=fp_update_elapsed,
         fp16_attention_seconds=fp_attention_elapsed,
         fp16_decode_seconds=fp_elapsed,
@@ -417,6 +427,7 @@ def run_qwen_decode_runtime_benchmark(
     rotation_seed: int = 0,
     fused_weights: bool = False,
     decode_strategy: str = "split_batched",
+    decode_tail_capacity: int | None = None,
     runner: Callable[..., QwenDecodeRuntimeBenchmarkResult] | None = None,
 ) -> QwenDecodeRuntimeBenchmarkResult:
     if decode_strategy not in SUPPORTED_DECODE_STRATEGIES:
@@ -431,10 +442,15 @@ def run_qwen_decode_runtime_benchmark(
         fused_weights=fused_weights,
     )
     runtime_runner = runner or _run_qwen_decode_runtime_benchmark_impl
+    resolved_decode_tail_capacity = resolve_qwen_decode_tail_capacity(
+        hidden_size=profile.hidden_size,
+        requested=decode_tail_capacity,
+    )
     return runtime_runner(
         profile=profile,
         prefill_tokens=prefill_tokens,
         decode_steps=decode_steps,
         seed=seed,
         decode_strategy=decode_strategy,
+        decode_tail_capacity=resolved_decode_tail_capacity,
     )

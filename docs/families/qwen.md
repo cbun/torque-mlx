@@ -122,6 +122,7 @@ torque-mlx benchmark qwen-generate \
   --prompt "hello" \
   --max-tokens 32 \
   --prefill-step-size 512 \
+  --ignore-eos \
   --profile-runtime
 ```
 
@@ -133,7 +134,10 @@ The current adapter:
 - can load `delta_npz` artifacts by loading the referenced base snapshot and applying the stored overrides first
 - uses dense-cache prompt prefill for converted full-attention layers, then switches those layers onto `TorqueKVCacheMLX` for single-token decode
 - buffers single-token decode appends through a small dense tail before flushing them into packed storage
-- can emit converted-layer runtime timing breakdowns with `--profile-runtime` to separate dense prefill, prompt append, decode append, aggregate append, and torque decode costs
+- exposes the tail size as `--decode-tail-capacity`; if omitted, the runtime now chooses a Qwen-specific default from the text hidden size
+- can emit converted-layer runtime timing breakdowns with `--profile-runtime` to separate dense prefill, prompt append, decode append, aggregate append, torque decode, packed score, softmax/merge, packed value accumulation, and dense-tail costs
+- supports fixed-length decode benchmarking with `--ignore-eos`, which keeps generation running to `max_tokens` even if EOS is emitted early
+- reports explicit converted-layer KV estimates for cache tokens, FP16 bytes, packed bytes, and bytes saved so the memory story is visible even when total process memory is dominated by model weights
 
 This is intentionally narrow. It is an experimental generation/runtime path for curated Qwen3.5 artifacts, not a generic MLX loader for arbitrary Hugging Face checkpoints.
 
@@ -167,6 +171,7 @@ This benchmark:
 - benchmarks only the autoregressive KV-growing decode path on MLX
 - compares MLX-LM FP16, MLX-LM quantized cache, and `TorqueKVCache`
 - defaults to the batched split kernel and can still force the prior per-head fused kernel for comparison
+- resolves the dense decode-tail size automatically from the Qwen text hidden size unless `--decode-tail-capacity` is set explicitly
 - reports projected KV cache bytes saved against FP16
 
 It is the right benchmark for answering whether torque improves the cache hot path. The text benchmark above is still useful, but it is a correctness check rather than a decode-kernel performance claim.

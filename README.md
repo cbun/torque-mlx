@@ -192,6 +192,7 @@ torque-mlx benchmark qwen-generate \
   --prompt "hello" \
   --max-tokens 32 \
   --prefill-step-size 512 \
+  --ignore-eos \
   --profile-runtime
 ```
 
@@ -230,9 +231,12 @@ The experimental Qwen MLX generation benchmark:
 - loads local `qwen3_5` snapshots through a repo-local MLX adapter that normalizes them onto the `qwen3_next` text runtime
 - can load both merged converted snapshots and `delta_npz` artifacts
 - can optionally synchronize and report converted-layer dense prefill, prompt append, decode append, aggregate append, and torque decode timings via `--profile-runtime`
+- also breaks torque decode into packed score, softmax/merge, packed value accumulation, and dense-tail work when profiling is enabled
 - uses dense cache prefill for hybrid Qwen3.5 prompt chunks, then routes converted `full_attention` decode through `TorqueKVCacheMLX`
 - buffers single-token decode appends through a small dense tail before flushing them into packed storage
-- reports prompt throughput, generation throughput, generated token count, and peak memory
+- can override that tail size through `--decode-tail-capacity`; by default the runtime now chooses it automatically from the Qwen text hidden size (`8` for smaller models like `0.8B`, `0` for `2B`-class models)
+- reports prompt throughput, generation throughput, generated token count, peak memory, and explicit converted-layer KV estimates for FP16 bytes, packed bytes, and bytes saved
+- supports fixed-length decode benchmarking with `--ignore-eos`, so source-vs-torque runs can compare the same number of generated tokens
 - is the first end-to-end MLX runtime path for converted Qwen artifacts in this repo
 - should still be treated as experimental until longer prompts and larger models are benchmarked systematically
 
