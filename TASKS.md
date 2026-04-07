@@ -57,6 +57,7 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [x] Move query rotation and output unrotation onto the MLX device path
 - [x] Add a runtime strategy switch so batched split and per-head fused kernels can be compared explicitly
 - [x] Evaluate a batched split-kernel path against the current fused kernel and promote the faster design
+- [x] Add a dedicated packed-plus-current-row decode path so single-token generation does not always fall back to the generic tail merge
 - [ ] Make the split-batched kernel saturate GPU occupancy on Apple silicon
 - [ ] Reduce bit-unpack and codebook-lookup overhead in the split-batched kernel path
 - [ ] Revisit threadgroup/grid layout and SIMD-group work partitioning for long-context decode
@@ -84,7 +85,10 @@ This task list is derived from [PRD.md](./PRD.md) and is ordered so the project 
 - [ ] Run at least one long-context evaluation benchmark
 - [x] Re-run Qwen decode benchmarks at multiple prefills after the GPU-resident cache upgrade
 - [x] Add a real MLX generation benchmark for converted Qwen snapshots
-- [ ] Benchmark real-model MLX generation on Qwen3.5 `0.8B`, `2B`, and a larger target model
+- [x] Benchmark real-model MLX generation on Qwen3.5 `0.8B` and `2B`
+- [x] Add a runtime-comparison benchmark that aligns real generation runs with the synthetic decode hot path
+- [x] Attribute profiled MLX generation time across converted full-attention layers, linear layers, and torque decode sub-stages
+- [ ] Benchmark real-model MLX generation on a larger target model
 - [ ] Measure GPU occupancy/utilization alongside throughput and KV bytes/token
 - [ ] Benchmark `4096+` token prefills on the split-batched default path
 - [ ] Publish a benchmark report that clearly separates synthetic decode geometry from real-model runtime results

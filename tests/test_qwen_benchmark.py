@@ -10,9 +10,12 @@ from torque_mlx.families.qwen import QWEN_MODEL_MANIFEST_FILE, QwenModelArtifact
 from torque_mlx.qwen_benchmark import (
     QwenDecodeBenchmarkProfile,
     QwenDecodeRuntimeBenchmarkResult,
+    QwenRuntimeComparisonResult,
     load_qwen_decode_benchmark_profile,
     run_qwen_decode_runtime_benchmark,
+    run_qwen_runtime_comparison,
 )
+from torque_mlx.qwen_mlx import QwenMLXGenerationResult
 from torque_mlx.quantization import Codebook
 from torque_mlx.rotation import RotationMode
 
@@ -250,3 +253,227 @@ def test_cli_parser_accepts_qwen_decode_tail_capacity() -> None:
 
     assert args.benchmark_command == "qwen-decode"
     assert args.decode_tail_capacity == 96
+
+
+def test_run_qwen_runtime_comparison_uses_generation_token_counts(tmp_path: Path) -> None:
+    model_dir = tmp_path / "torque"
+    model_dir.mkdir()
+
+    def _fake_generation(**kwargs):
+        assert kwargs["model_dir"] == model_dir
+        assert kwargs["max_tokens"] == 64
+        return QwenMLXGenerationResult(
+            model_dir=str(model_dir),
+            prompt="hello",
+            max_tokens=64,
+            prefill_step_size=128,
+            decode_tail_capacity=8,
+            ignore_eos=True,
+            generated_text=" world",
+            prompt_tokens=321,
+            prompt_tokens_per_second=100.0,
+            generation_tokens=32,
+            generation_tokens_per_second=20.0,
+            peak_memory_gb=1.0,
+            kv_cache_tokens=353,
+            full_attention_layer_count=1,
+            full_attention_kv_fp16_bytes_estimate=1024,
+            full_attention_kv_packed_bytes_estimate=256,
+            full_attention_kv_bytes_saved_estimate=768,
+            is_torque_converted=True,
+            artifact_layout="delta_npz",
+            converted_layer_indices=(3,),
+        )
+
+    def _fake_decode(**kwargs):
+        assert kwargs["prefill_tokens"] == 321
+        assert kwargs["decode_steps"] == 32
+        assert kwargs["decode_tail_capacity"] == 8
+        profile = QwenDecodeBenchmarkProfile(
+            model_dir=str(model_dir),
+            profile_source="torque_manifest",
+            model_type="qwen3_5",
+            text_model_type="qwen3_5",
+            hidden_size=1024,
+            head_dim=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            target_layer_indices=(3,),
+            bit_width=4,
+            rotation_seed=0,
+            fused_weights=False,
+            has_vision_config=False,
+            attn_output_gate=True,
+        )
+        return QwenDecodeRuntimeBenchmarkResult(
+            profile=profile,
+            prefill_tokens=321,
+            decode_steps=32,
+            seed=7,
+            torque_decode_strategy="split_batched",
+            torque_decode_tail_capacity=8,
+            fp16_update_seconds=0.2,
+            fp16_attention_seconds=0.3,
+            fp16_decode_seconds=1.0,
+            mlx_lm_quantized_update_seconds=0.4,
+            mlx_lm_quantized_attention_seconds=0.5,
+            mlx_lm_quantized_decode_seconds=2.0,
+            torque_append_seconds=0.1,
+            torque_kernel_seconds=0.2,
+            torque_decode_seconds=0.5,
+            max_abs_error_quantized_vs_fp16=0.1,
+            max_abs_error_torque_vs_fp16=0.2,
+        )
+
+    result = run_qwen_runtime_comparison(
+        model_dir=model_dir,
+        prompt="hello",
+        max_tokens=64,
+        prefill_step_size=128,
+        ignore_eos=True,
+        profile_runtime=False,
+        seed=7,
+        decode_strategy="split_batched",
+        generation_runner=_fake_generation,
+        decode_runner=_fake_decode,
+    )
+
+    assert isinstance(result, QwenRuntimeComparisonResult)
+    payload = result.to_dict()
+    assert payload["benchmark"] == "qwen_runtime_compare"
+    assert payload["prompt_tokens"] == 321
+    assert payload["generation_tokens"] == 32
+    assert payload["hot_path_tokens_per_sec"] == 64.0
+    assert payload["generation_tokens_per_sec"] == 20.0
+    assert payload["generation_fraction_of_hot_path"] == 20.0 / 64.0
+
+
+def test_cli_benchmark_qwen_runtime_compare_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "torque"
+    model_dir.mkdir()
+
+    def _fake_compare(**kwargs):
+        assert kwargs["model_dir"] == str(model_dir)
+        assert kwargs["prompt"] == "hello"
+        assert kwargs["max_tokens"] == 32
+        assert kwargs["prefill_step_size"] == 128
+        assert kwargs["ignore_eos"] is True
+        assert kwargs["seed"] == 11
+        profile = QwenDecodeBenchmarkProfile(
+            model_dir=str(model_dir),
+            profile_source="torque_manifest",
+            model_type="qwen3_5",
+            text_model_type="qwen3_5",
+            hidden_size=1024,
+            head_dim=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            target_layer_indices=(3,),
+            bit_width=4,
+            rotation_seed=0,
+            fused_weights=False,
+            has_vision_config=False,
+            attn_output_gate=True,
+        )
+        generation = QwenMLXGenerationResult(
+            model_dir=str(model_dir),
+            prompt="hello",
+            max_tokens=32,
+            prefill_step_size=128,
+            decode_tail_capacity=8,
+            ignore_eos=True,
+            generated_text=" world",
+            prompt_tokens=100,
+            prompt_tokens_per_second=50.0,
+            generation_tokens=32,
+            generation_tokens_per_second=10.0,
+            peak_memory_gb=1.5,
+            kv_cache_tokens=132,
+            full_attention_layer_count=1,
+            full_attention_kv_fp16_bytes_estimate=2048,
+            full_attention_kv_packed_bytes_estimate=512,
+            full_attention_kv_bytes_saved_estimate=1536,
+            is_torque_converted=True,
+            artifact_layout="delta_npz",
+            converted_layer_indices=(3,),
+        )
+        decode = QwenDecodeRuntimeBenchmarkResult(
+            profile=profile,
+            prefill_tokens=100,
+            decode_steps=32,
+            seed=11,
+            torque_decode_strategy="split_batched",
+            torque_decode_tail_capacity=8,
+            fp16_update_seconds=0.2,
+            fp16_attention_seconds=0.3,
+            fp16_decode_seconds=1.0,
+            mlx_lm_quantized_update_seconds=0.4,
+            mlx_lm_quantized_attention_seconds=0.5,
+            mlx_lm_quantized_decode_seconds=2.0,
+            torque_append_seconds=0.1,
+            torque_kernel_seconds=0.2,
+            torque_decode_seconds=0.5,
+            max_abs_error_quantized_vs_fp16=0.1,
+            max_abs_error_torque_vs_fp16=0.2,
+        )
+        return QwenRuntimeComparisonResult(
+            model_dir=str(model_dir),
+            prompt="hello",
+            decode_strategy="split_batched",
+            decode_tail_capacity=8,
+            generation=generation,
+            decode_runtime=decode,
+        )
+
+    monkeypatch.setattr("torque_mlx.cli.run_qwen_runtime_comparison", _fake_compare)
+
+    exit_code = main(
+        [
+            "benchmark",
+            "qwen-runtime-compare",
+            "--model-dir",
+            str(model_dir),
+            "--prompt",
+            "hello",
+            "--max-tokens",
+            "32",
+            "--prefill-step-size",
+            "128",
+            "--ignore-eos",
+            "--seed",
+            "11",
+        ],
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["benchmark"] == "qwen_runtime_compare"
+    assert payload["generation"]["generation_tokens_per_second"] == 10.0
+    assert payload["decode_runtime"]["torque_mlx_tokens_per_sec"] == 64.0
+
+
+def test_cli_parser_accepts_qwen_runtime_compare() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "benchmark",
+            "qwen-runtime-compare",
+            "--model-dir",
+            "./artifact",
+            "--prompt",
+            "hello",
+            "--max-tokens",
+            "32",
+            "--ignore-eos",
+        ],
+    )
+
+    assert args.benchmark_command == "qwen-runtime-compare"
+    assert args.max_tokens == 32
+    assert args.ignore_eos is True

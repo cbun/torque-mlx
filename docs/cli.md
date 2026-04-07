@@ -112,6 +112,7 @@ Available benchmark modes:
 - `qwen-text`
 - `qwen-decode`
 - `qwen-generate`
+- `qwen-runtime-compare`
 
 Example:
 
@@ -186,6 +187,7 @@ This report includes:
 - peak MLX memory during the run
 - converted-layer KV cache tokens plus estimated FP16 bytes, packed bytes, and bytes saved for the torque-targeted full-attention layers
 - the resolved dense decode-tail capacity used by the torque cache
+- optional layer-category timing breakdowns for converted full-attention layers, passthrough attention layers, and linear layers when `--profile-runtime` is set
 - optional converted-layer timing breakdowns for dense prefill, prompt append, decode append, aggregate append, torque decode, packed score, softmax/merge, packed value accumulation, and dense-tail work when `--profile-runtime` is set
 
 Notes:
@@ -194,6 +196,31 @@ Notes:
 - `--ignore-eos` keeps generation running until `max_tokens`, which is useful for fixed-length source-vs-torque performance comparisons
 
 This command exercises the repo-local MLX adapter for `qwen3_5` snapshots. It is the current end-to-end generation smoke path for converted Qwen artifacts, but it should still be treated as experimental.
+
+Compare the end-to-end MLX generation path against the matching synthetic decode hot path:
+
+```bash
+torque-mlx benchmark qwen-runtime-compare \
+  --model-dir ./artifacts/qwen3.5-2b-torque-delta \
+  --prompt "hello" \
+  --max-tokens 128 \
+  --prefill-step-size 128 \
+  --ignore-eos
+```
+
+This report:
+
+- runs `qwen-generate` first on a converted torque artifact
+- reuses the observed prompt token count and generated token count for `qwen-decode`
+- reports the synthetic hot-path throughput next to the real end-to-end generation throughput
+- makes the remaining gap between packed decode and the full MLX runtime explicit
+- nests the full `qwen-generate` and `qwen-decode` results for deeper inspection
+
+Notes:
+
+- this mode requires a converted torque Qwen artifact because it uses the manifest/runtime profile from that artifact
+- `--profile-runtime` only affects the nested generation report; the synthetic decode report already includes its own timing breakdown
+- `--ignore-eos` is useful here because it keeps the generated length fixed, which makes the hot-path comparison cleaner
 
 ### `eval`
 

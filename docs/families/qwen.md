@@ -135,7 +135,7 @@ The current adapter:
 - uses dense-cache prompt prefill for converted full-attention layers, then switches those layers onto `TorqueKVCacheMLX` for single-token decode
 - buffers single-token decode appends through a small dense tail before flushing them into packed storage
 - exposes the tail size as `--decode-tail-capacity`; if omitted, the runtime now chooses a Qwen-specific default from the text hidden size
-- can emit converted-layer runtime timing breakdowns with `--profile-runtime` to separate dense prefill, prompt append, decode append, aggregate append, torque decode, packed score, softmax/merge, packed value accumulation, and dense-tail costs
+- can emit runtime timing breakdowns with `--profile-runtime` to separate converted full-attention layers, linear layers, passthrough attention layers, dense prefill, prompt append, decode append, aggregate append, torque decode, packed score, softmax/merge, packed value accumulation, and dense-tail costs
 - supports fixed-length decode benchmarking with `--ignore-eos`, which keeps generation running to `max_tokens` even if EOS is emitted early
 - reports explicit converted-layer KV estimates for cache tokens, FP16 bytes, packed bytes, and bytes saved so the memory story is visible even when total process memory is dominated by model weights
 
@@ -175,6 +175,19 @@ This benchmark:
 - reports projected KV cache bytes saved against FP16
 
 It is the right benchmark for answering whether torque improves the cache hot path. The text benchmark above is still useful, but it is a correctness check rather than a decode-kernel performance claim.
+
+To compare that packed hot path against the real end-to-end MLX runtime, run:
+
+```bash
+torque-mlx benchmark qwen-runtime-compare \
+  --model-dir ./artifacts/qwen3.5-2b-torque-delta \
+  --prompt "hello" \
+  --max-tokens 128 \
+  --prefill-step-size 128 \
+  --ignore-eos
+```
+
+This mode runs `qwen-generate` first, then reuses the observed prompt and generated token counts for `qwen-decode`. The result makes the remaining gap between the packed decode path and the full MLX Qwen runtime explicit.
 
 ## Publishing Guidance
 

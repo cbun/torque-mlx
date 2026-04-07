@@ -87,6 +87,15 @@ class QwenMLXRuntimeProfile:
     dense_prefill_seconds: float = 0.0
     dense_prefill_calls: int = 0
     dense_prefill_tokens: int = 0
+    converted_attention_seconds: float = 0.0
+    converted_attention_calls: int = 0
+    converted_attention_tokens: int = 0
+    passthrough_attention_seconds: float = 0.0
+    passthrough_attention_calls: int = 0
+    passthrough_attention_tokens: int = 0
+    linear_layer_seconds: float = 0.0
+    linear_layer_calls: int = 0
+    linear_layer_tokens: int = 0
     prompt_append_seconds: float = 0.0
     prompt_append_calls: int = 0
     prompt_append_tokens: int = 0
@@ -109,6 +118,15 @@ class QwenMLXRuntimeProfile:
             "dense_prefill_seconds": self.dense_prefill_seconds,
             "dense_prefill_calls": self.dense_prefill_calls,
             "dense_prefill_tokens": self.dense_prefill_tokens,
+            "converted_attention_seconds": self.converted_attention_seconds,
+            "converted_attention_calls": self.converted_attention_calls,
+            "converted_attention_tokens": self.converted_attention_tokens,
+            "passthrough_attention_seconds": self.passthrough_attention_seconds,
+            "passthrough_attention_calls": self.passthrough_attention_calls,
+            "passthrough_attention_tokens": self.passthrough_attention_tokens,
+            "linear_layer_seconds": self.linear_layer_seconds,
+            "linear_layer_calls": self.linear_layer_calls,
+            "linear_layer_tokens": self.linear_layer_tokens,
             "prompt_append_seconds": self.prompt_append_seconds,
             "prompt_append_calls": self.prompt_append_calls,
             "prompt_append_tokens": self.prompt_append_tokens,
@@ -191,6 +209,15 @@ class _QwenMLXRuntimeProfiler:
     dense_prefill_seconds: float = 0.0
     dense_prefill_calls: int = 0
     dense_prefill_tokens: int = 0
+    converted_attention_seconds: float = 0.0
+    converted_attention_calls: int = 0
+    converted_attention_tokens: int = 0
+    passthrough_attention_seconds: float = 0.0
+    passthrough_attention_calls: int = 0
+    passthrough_attention_tokens: int = 0
+    linear_layer_seconds: float = 0.0
+    linear_layer_calls: int = 0
+    linear_layer_tokens: int = 0
     prompt_append_seconds: float = 0.0
     prompt_append_calls: int = 0
     prompt_append_tokens: int = 0
@@ -212,6 +239,21 @@ class _QwenMLXRuntimeProfiler:
         self.dense_prefill_seconds += seconds
         self.dense_prefill_calls += 1
         self.dense_prefill_tokens += tokens
+
+    def record_converted_attention(self, *, seconds: float, tokens: int) -> None:
+        self.converted_attention_seconds += seconds
+        self.converted_attention_calls += 1
+        self.converted_attention_tokens += tokens
+
+    def record_passthrough_attention(self, *, seconds: float, tokens: int) -> None:
+        self.passthrough_attention_seconds += seconds
+        self.passthrough_attention_calls += 1
+        self.passthrough_attention_tokens += tokens
+
+    def record_linear_layer(self, *, seconds: float, tokens: int) -> None:
+        self.linear_layer_seconds += seconds
+        self.linear_layer_calls += 1
+        self.linear_layer_tokens += tokens
 
     def record_prompt_append(self, *, seconds: float, tokens: int) -> None:
         self.prompt_append_seconds += seconds
@@ -244,6 +286,15 @@ class _QwenMLXRuntimeProfiler:
             dense_prefill_seconds=self.dense_prefill_seconds,
             dense_prefill_calls=self.dense_prefill_calls,
             dense_prefill_tokens=self.dense_prefill_tokens,
+            converted_attention_seconds=self.converted_attention_seconds,
+            converted_attention_calls=self.converted_attention_calls,
+            converted_attention_tokens=self.converted_attention_tokens,
+            passthrough_attention_seconds=self.passthrough_attention_seconds,
+            passthrough_attention_calls=self.passthrough_attention_calls,
+            passthrough_attention_tokens=self.passthrough_attention_tokens,
+            linear_layer_seconds=self.linear_layer_seconds,
+            linear_layer_calls=self.linear_layer_calls,
+            linear_layer_tokens=self.linear_layer_tokens,
             prompt_append_seconds=self.prompt_append_seconds,
             prompt_append_calls=self.prompt_append_calls,
             prompt_append_tokens=self.prompt_append_tokens,
@@ -421,6 +472,8 @@ def _build_qwen3_5_mlx_model(config: Mapping[str, object]):
             super().__init__()
             self.args = Qwen3NextArgs.from_dict(_normalize_qwen3_5_text_config(args.text_config))
             self.language_model = Qwen3NextModel(self.args)
+            self.runtime_profiler = None
+            self.converted_layer_indices = frozenset()
 
         def __call__(self, inputs, cache=None, input_embeddings=None):
             if input_embeddings is not None:
@@ -437,8 +490,21 @@ def _build_qwen3_5_mlx_model(config: Mapping[str, object]):
             fa_mask = create_attention_mask(hidden_states, cache[fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[0])
 
-            for layer, layer_cache in zip(self.language_model.layers, cache):
+            for layer_idx, (layer, layer_cache) in enumerate(zip(self.language_model.layers, cache)):
                 mask = ssm_mask if layer.is_linear else fa_mask
+                if self.runtime_profiler is not None:
+                    layer_start = perf_counter()
+                    hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+                    mx.eval(hidden_states)
+                    elapsed = perf_counter() - layer_start
+                    tokens = int(hidden_states.shape[1])
+                    if layer.is_linear:
+                        self.runtime_profiler.record_linear_layer(seconds=elapsed, tokens=tokens)
+                    elif layer_idx in self.converted_layer_indices:
+                        self.runtime_profiler.record_converted_attention(seconds=elapsed, tokens=tokens)
+                    else:
+                        self.runtime_profiler.record_passthrough_attention(seconds=elapsed, tokens=tokens)
+                    continue
                 hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
             return self.language_model.norm(hidden_states)
 
@@ -844,6 +910,9 @@ def _patch_qwen_mlx_runtime(
         head_dim=manifest.runtime_config.head_dim,
         seed=manifest.runtime_config.rotation_seed,
     )
+    converted = frozenset(int(idx) for idx in manifest.converted_layer_indices)
+    model.model.runtime_profiler = profiler
+    model.model.converted_layer_indices = converted
     rotation_matrix = mx.array(rotation.matrix().astype(np.float32))
     rotation_signs_left = mx.array(rotation.signs_left.astype(np.float32))
     rotation_signs_right = mx.array(rotation.signs_right.astype(np.float32))

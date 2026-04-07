@@ -7,6 +7,7 @@ from torque_mlx.mlx_ops import (
     decode_packed_attention,
     decode_packed_attention_split,
     decode_packed_attention_split_batched,
+    decode_packed_attention_split_batched_with_current,
     metal_available,
     quantize_and_pack_rows_metal,
     quantize_and_pack_rows_dual_metal,
@@ -212,6 +213,69 @@ def test_batched_split_decode_matches_reference(head_dim: int) -> None:
                 query[batch_idx],
                 codebook.centroids[key_indices[batch_idx]],
                 codebook.centroids[value_indices[batch_idx]],
+            )
+            for batch_idx in range(batch_size)
+        ],
+        axis=0,
+    )
+    np.testing.assert_allclose(np.array(actual), expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not metal_available(), reason="Metal toolchain unavailable")
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_batched_split_decode_with_current_matches_reference(head_dim: int) -> None:
+    bit_width = 4
+    batch_size = 5
+    seq_len = 9
+    codebook = Codebook(
+        bit_width=bit_width,
+        centroids=np.linspace(-1.0, 1.0, 1 << bit_width, dtype=np.float32),
+        name="uniform",
+    )
+    rng = np.random.default_rng(21)
+    query = rng.uniform(-1.0, 1.0, size=(batch_size, head_dim)).astype(np.float32)
+    keys = rng.uniform(-1.0, 1.0, size=(batch_size, seq_len, head_dim)).astype(np.float32)
+    values = rng.uniform(-1.0, 1.0, size=(batch_size, seq_len, head_dim)).astype(np.float32)
+    current_keys = rng.uniform(-1.0, 1.0, size=(batch_size, head_dim)).astype(np.float32)
+    current_values = rng.uniform(-1.0, 1.0, size=(batch_size, head_dim)).astype(np.float32)
+
+    centroids = codebook.centroids.reshape(1, 1, 1, -1)
+    key_indices = np.argmin(np.abs(keys[..., None] - centroids), axis=-1).astype(np.uint8)
+    value_indices = np.argmin(np.abs(values[..., None] - centroids), axis=-1).astype(np.uint8)
+    packed_k = np.stack(
+        [np.stack([pack_indices(row, bit_width) for row in batch_rows], axis=0) for batch_rows in key_indices],
+        axis=0,
+    ).astype(np.uint32)
+    packed_v = np.stack(
+        [np.stack([pack_indices(row, bit_width) for row in batch_rows], axis=0) for batch_rows in value_indices],
+        axis=0,
+    ).astype(np.uint32)
+
+    actual = decode_packed_attention_split_batched_with_current(
+        mlx.array(query),
+        mlx.array(packed_k),
+        mlx.array(packed_v),
+        mlx.array(codebook.centroids),
+        mlx.array(codebook.centroids),
+        mlx.array(current_keys),
+        mlx.array(current_values),
+        bit_width=bit_width,
+        head_dim=head_dim,
+    )
+    mlx.eval(actual)
+
+    expected = np.stack(
+        [
+            streaming_attention_decode(
+                query[batch_idx],
+                np.concatenate(
+                    [codebook.centroids[key_indices[batch_idx]], current_keys[batch_idx : batch_idx + 1]],
+                    axis=0,
+                ),
+                np.concatenate(
+                    [codebook.centroids[value_indices[batch_idx]], current_values[batch_idx : batch_idx + 1]],
+                    axis=0,
+                ),
             )
             for batch_idx in range(batch_size)
         ],

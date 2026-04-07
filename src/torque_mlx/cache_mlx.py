@@ -12,6 +12,7 @@ from torque_mlx.mlx_ops import (
     accumulate_packed_values_batched,
     decode_packed_attention,
     decode_packed_attention_split_batched,
+    decode_packed_attention_split_batched_with_current,
     metal_available,
     quantize_and_pack_rows_metal,
     quantize_and_pack_rows_dual_metal,
@@ -563,20 +564,20 @@ class TorqueKVCacheMLX:
 
         tail_token_count = int(tail_keys.shape[1])
         if tail_token_count == 1:
+            current_tail_keys = tail_keys[:, 0, :].astype(mx.float32)
+            current_tail_values = tail_values[:, 0, :].astype(mx.float32)
+
             tail_started = perf_counter() if profile is not None else 0.0
-            tail_scores = mx.sum(
-                tail_keys[:, 0, :].astype(mx.float32) * query_rot_flat,
+            current_scores = mx.sum(
+                current_tail_keys * query_rot_flat,
                 axis=1,
                 keepdims=True,
             )
-            self._record_profile_timing(profile, "tail_seconds", tail_started, tail_scores)
+            self._record_profile_timing(profile, "tail_seconds", tail_started, current_scores)
 
             if packed_length == 0:
-                softmax_started = perf_counter() if profile is not None else 0.0
-                tail_weights = mx.softmax(tail_scores * scale, axis=1)
-                self._record_profile_timing(profile, "softmax_seconds", softmax_started, tail_weights)
                 tail_started = perf_counter() if profile is not None else 0.0
-                tail_out = tail_values[:, 0, :].astype(mx.float32) * tail_weights
+                tail_out = current_tail_values
                 self._record_profile_timing(profile, "tail_seconds", tail_started, tail_out)
                 return tail_out
 
@@ -586,6 +587,18 @@ class TorqueKVCacheMLX:
             else:
                 batched_k_codes = self._key_codes[layer_indices, kv_head_indices, :packed_length, :]
                 batched_v_codes = self._value_codes[layer_indices, kv_head_indices, :packed_length, :]
+            if profile is None:
+                return decode_packed_attention_split_batched_with_current(
+                    query_rot_flat,
+                    batched_k_codes,
+                    batched_v_codes,
+                    self._key_centroids,
+                    self._value_centroids,
+                    current_tail_keys,
+                    current_tail_values,
+                    bit_width=self.config.bit_width,
+                    head_dim=self.config.head_dim,
+                )
             score_started = perf_counter() if profile is not None else 0.0
             packed_scores = score_packed_query_batched(
                 query_rot_flat,
@@ -596,12 +609,27 @@ class TorqueKVCacheMLX:
             )
             self._record_profile_timing(profile, "packed_score_seconds", score_started, packed_scores)
             softmax_started = perf_counter() if profile is not None else 0.0
-            all_scores = mx.concatenate([packed_scores, tail_scores], axis=1)
-            all_weights = mx.softmax(all_scores * scale, axis=1)
-            self._record_profile_timing(profile, "softmax_seconds", softmax_started, all_weights)
+            packed_scores_scaled = packed_scores * scale
+            current_scores_scaled = current_scores * scale
+            max_scores = mx.maximum(
+                mx.max(packed_scores_scaled, axis=1, keepdims=True),
+                current_scores_scaled,
+            )
+            packed_exp = mx.exp(packed_scores_scaled - max_scores)
+            current_exp = mx.exp(current_scores_scaled - max_scores)
+            denom = mx.sum(packed_exp, axis=1, keepdims=True) + current_exp
+            packed_weights = packed_exp / denom
+            current_weights = current_exp / denom
+            self._record_profile_timing(
+                profile,
+                "softmax_seconds",
+                softmax_started,
+                packed_weights,
+                current_weights,
+            )
             value_started = perf_counter() if profile is not None else 0.0
             packed_out = accumulate_packed_values_batched(
-                all_weights[:, :packed_length],
+                packed_weights,
                 batched_v_codes,
                 self._value_centroids,
                 bit_width=self.config.bit_width,
@@ -609,7 +637,7 @@ class TorqueKVCacheMLX:
             )
             self._record_profile_timing(profile, "packed_value_seconds", value_started, packed_out)
             tail_started = perf_counter() if profile is not None else 0.0
-            tail_out = tail_values[:, 0, :].astype(mx.float32) * all_weights[:, packed_length : packed_length + 1]
+            tail_out = current_tail_values * current_weights
             self._record_profile_timing(profile, "tail_seconds", tail_started, tail_out)
             return packed_out + tail_out
 

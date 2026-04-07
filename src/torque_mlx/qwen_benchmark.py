@@ -17,7 +17,11 @@ from torque_mlx.families.qwen import (
 )
 from torque_mlx.mlx_ops import metal_available
 from torque_mlx.quantization import kv_bytes_per_token
-from torque_mlx.qwen_mlx import resolve_qwen_decode_tail_capacity
+from torque_mlx.qwen_mlx import (
+    QwenMLXGenerationResult,
+    benchmark_qwen_mlx_generation,
+    resolve_qwen_decode_tail_capacity,
+)
 
 
 def _fp16_kv_bytes_per_token(*, head_dim: int, kv_heads: int) -> int:
@@ -169,6 +173,39 @@ class QwenDecodeRuntimeBenchmarkResult:
             "torque_mlx_tokens_per_sec": self.decode_steps / self.torque_decode_seconds if self.torque_decode_seconds > 0 else 0.0,
             "max_abs_error_quantized_vs_fp16": self.max_abs_error_quantized_vs_fp16,
             "max_abs_error_torque_vs_fp16": self.max_abs_error_torque_vs_fp16,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QwenRuntimeComparisonResult:
+    model_dir: str
+    prompt: str
+    decode_strategy: str
+    decode_tail_capacity: int
+    generation: QwenMLXGenerationResult
+    decode_runtime: QwenDecodeRuntimeBenchmarkResult
+
+    def to_dict(self) -> dict[str, object]:
+        hot_path_tps = self.decode_runtime.to_dict()["torque_mlx_tokens_per_sec"]
+        generation_tps = self.generation.generation_tokens_per_second
+        return {
+            "family": "qwen",
+            "benchmark": "qwen_runtime_compare",
+            "model_dir": self.model_dir,
+            "decode_strategy": self.decode_strategy,
+            "decode_tail_capacity": self.decode_tail_capacity,
+            "prompt_tokens": self.generation.prompt_tokens,
+            "generation_tokens": self.generation.generation_tokens,
+            "hot_path_tokens_per_sec": hot_path_tps,
+            "generation_tokens_per_sec": generation_tps,
+            "generation_fraction_of_hot_path": (generation_tps / hot_path_tps) if hot_path_tps > 0 else 0.0,
+            "hot_path_minus_generation_tokens_per_sec": hot_path_tps - generation_tps,
+            "notes": [
+                "This benchmark runs the end-to-end MLX Qwen generation path first, then reuses the observed prompt and generated token counts to run the synthetic KV-growing decode hot path on matching geometry.",
+                "The gap between hot_path_tokens_per_sec and generation_tokens_per_sec is the remaining runtime overhead outside the packed decode kernel path.",
+            ],
+            "generation": self.generation.to_dict(),
+            "decode_runtime": self.decode_runtime.to_dict(),
         }
 
 
@@ -453,4 +490,70 @@ def run_qwen_decode_runtime_benchmark(
         seed=seed,
         decode_strategy=decode_strategy,
         decode_tail_capacity=resolved_decode_tail_capacity,
+    )
+
+
+def run_qwen_runtime_comparison(
+    *,
+    model_dir: str | Path,
+    prompt: str,
+    max_tokens: int,
+    prefill_step_size: int,
+    ignore_eos: bool,
+    profile_runtime: bool,
+    seed: int,
+    bit_width: int | None = None,
+    rotation_seed: int = 0,
+    fused_weights: bool = False,
+    decode_strategy: str = "split_batched",
+    decode_tail_capacity: int | None = None,
+    generation_runner: Callable[..., QwenMLXGenerationResult] | None = None,
+    decode_runner: Callable[..., QwenDecodeRuntimeBenchmarkResult] | None = None,
+) -> QwenRuntimeComparisonResult:
+    generation_impl = generation_runner or benchmark_qwen_mlx_generation
+    generation_result = generation_impl(
+        model_dir=model_dir,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        prefill_step_size=prefill_step_size,
+        profile_runtime=profile_runtime,
+        decode_tail_capacity=decode_tail_capacity,
+        ignore_eos=ignore_eos,
+    )
+    if not generation_result.is_torque_converted:
+        raise ValueError("qwen-runtime-compare requires a converted torque Qwen artifact")
+    if generation_result.generation_tokens <= 0:
+        raise ValueError("qwen-runtime-compare requires at least one generated token")
+
+    if decode_runner is not None:
+        decode_result = decode_runner(
+            model_dir=model_dir,
+            prefill_tokens=generation_result.prompt_tokens,
+            decode_steps=generation_result.generation_tokens,
+            seed=seed,
+            bit_width=bit_width,
+            rotation_seed=rotation_seed,
+            fused_weights=fused_weights,
+            decode_strategy=decode_strategy,
+            decode_tail_capacity=generation_result.decode_tail_capacity,
+        )
+    else:
+        decode_result = run_qwen_decode_runtime_benchmark(
+            model_dir=model_dir,
+            prefill_tokens=generation_result.prompt_tokens,
+            decode_steps=generation_result.generation_tokens,
+            seed=seed,
+            bit_width=bit_width,
+            rotation_seed=rotation_seed,
+            fused_weights=fused_weights,
+            decode_strategy=decode_strategy,
+            decode_tail_capacity=generation_result.decode_tail_capacity,
+        )
+    return QwenRuntimeComparisonResult(
+        model_dir=str(Path(model_dir).resolve()),
+        prompt=prompt,
+        decode_strategy=decode_strategy,
+        decode_tail_capacity=generation_result.decode_tail_capacity,
+        generation=generation_result,
+        decode_runtime=decode_result,
     )

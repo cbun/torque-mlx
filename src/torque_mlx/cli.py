@@ -20,7 +20,7 @@ from torque_mlx.families.qwen import (
 from torque_mlx.cache_mlx import SUPPORTED_DECODE_STRATEGIES
 from torque_mlx.qwen_eval import benchmark_qwen_text_models, evaluate_qwen_text_perplexity
 from torque_mlx.qwen_mlx import benchmark_qwen_mlx_generation
-from torque_mlx.qwen_benchmark import run_qwen_decode_runtime_benchmark
+from torque_mlx.qwen_benchmark import run_qwen_decode_runtime_benchmark, run_qwen_runtime_comparison
 
 
 def _print_json(payload: dict[str, object]) -> None:
@@ -191,6 +191,71 @@ def build_parser() -> argparse.ArgumentParser:
         "--decode-tail-capacity",
         type=int,
         help="Override the number of recent decode tokens kept dense before they are flushed into packed storage. Defaults to an auto heuristic based on the Qwen text hidden size.",
+    )
+
+    qwen_runtime_compare_parser = benchmark_subparsers.add_parser(
+        "qwen-runtime-compare",
+        help="Compare the end-to-end MLX Qwen generation path against the matching synthetic KV decode hot path.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--model-dir",
+        required=True,
+        help="Converted torque Qwen artifact to benchmark.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--prompt",
+        required=True,
+        help="Prompt used for generation benchmarking.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=64,
+        help="Maximum number of tokens to generate before running the matching decode hot-path benchmark.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=512,
+        help="Prompt prefill chunk size passed through to mlx-lm generation.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--profile-runtime",
+        action="store_true",
+        help="Include the converted-layer runtime timing breakdown from qwen-generate in the nested generation report.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Continue generation until max_tokens even if the model emits EOS, so the hot-path benchmark uses the requested decode length.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for the synthetic decode workload.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--bit-width",
+        type=int,
+        help="Bit width override when benchmarking from a converted artifact with a different runtime profile.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--rotation-seed",
+        type=int,
+        default=0,
+        help="Rotation seed override when benchmarking from an artifact with a different runtime profile.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--decode-strategy",
+        default="split_batched",
+        choices=SUPPORTED_DECODE_STRATEGIES,
+        help="Torque decode kernel strategy for the synthetic hot-path benchmark.",
+    )
+    qwen_runtime_compare_parser.add_argument(
+        "--decode-tail-capacity",
+        type=int,
+        help="Override the number of recent decode tokens kept dense before they are flushed into packed storage. Defaults to the same auto heuristic used by qwen-generate.",
     )
 
     eval_parser = subparsers.add_parser(
@@ -366,13 +431,30 @@ def main(argv: list[str] | None = None) -> int:
                 benchmark_qwen_mlx_generation(
                     model_dir=args.model_dir,
                     prompt=args.prompt,
-                max_tokens=args.max_tokens,
-                prefill_step_size=args.prefill_step_size,
-                profile_runtime=args.profile_runtime,
-                decode_tail_capacity=args.decode_tail_capacity,
-                ignore_eos=args.ignore_eos,
-            ).to_dict(),
-        )
+                    max_tokens=args.max_tokens,
+                    prefill_step_size=args.prefill_step_size,
+                    profile_runtime=args.profile_runtime,
+                    decode_tail_capacity=args.decode_tail_capacity,
+                    ignore_eos=args.ignore_eos,
+                ).to_dict(),
+            )
+            return 0
+        if args.benchmark_command == "qwen-runtime-compare":
+            _print_json(
+                run_qwen_runtime_comparison(
+                    model_dir=args.model_dir,
+                    prompt=args.prompt,
+                    max_tokens=args.max_tokens,
+                    prefill_step_size=args.prefill_step_size,
+                    ignore_eos=args.ignore_eos,
+                    profile_runtime=args.profile_runtime,
+                    seed=args.seed,
+                    bit_width=args.bit_width,
+                    rotation_seed=args.rotation_seed,
+                    decode_strategy=args.decode_strategy,
+                    decode_tail_capacity=args.decode_tail_capacity,
+                ).to_dict(),
+            )
             return 0
         parser.error(f"Unknown benchmark command: {args.benchmark_command}")
 

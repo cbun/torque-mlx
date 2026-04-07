@@ -595,6 +595,71 @@ def decode_packed_attention_split_batched(
     )
 
 
+def decode_packed_attention_split_batched_with_current(
+    query: mx.array,
+    k_codes: mx.array,
+    v_codes: mx.array,
+    centroids_k: mx.array,
+    centroids_v: mx.array,
+    current_keys: mx.array,
+    current_values: mx.array,
+    *,
+    bit_width: int,
+    head_dim: int,
+) -> mx.array:
+    if len(query.shape) != 2 or query.shape[1] != head_dim:
+        raise ValueError(f"batched query must have shape (batch, {head_dim}), got {query.shape}")
+    if len(current_keys.shape) != 2 or current_keys.shape != query.shape:
+        raise ValueError(
+            f"current_keys must have shape {query.shape}, got {current_keys.shape}",
+        )
+    if len(current_values.shape) != 2 or current_values.shape != query.shape:
+        raise ValueError(
+            f"current_values must have shape {query.shape}, got {current_values.shape}",
+        )
+    if len(k_codes.shape) != 3 or len(v_codes.shape) != 3:
+        raise ValueError("packed codes must have shape (batch, seq, packed_words)")
+    if k_codes.shape != v_codes.shape:
+        raise ValueError(f"k_codes and v_codes must match, got {k_codes.shape} and {v_codes.shape}")
+    if k_codes.shape[0] != query.shape[0]:
+        raise ValueError(
+            "packed codes and query must agree on batch dimension",
+        )
+
+    batch_size = int(query.shape[0])
+    seq_len = int(k_codes.shape[1])
+    if seq_len == 0:
+        return current_values.astype(mx.float32)
+
+    scores = score_packed_query_batched(
+        query,
+        k_codes,
+        centroids_k,
+        bit_width=bit_width,
+        head_dim=head_dim,
+    )
+    scale = 1.0 / sqrt(head_dim)
+    packed_scores = scores * scale
+    current_scores = (
+        mx.sum(query.astype(mx.float32) * current_keys.astype(mx.float32), axis=1, keepdims=True)
+        * scale
+    )
+    max_scores = mx.maximum(mx.max(packed_scores, axis=1, keepdims=True), current_scores)
+    packed_exp = mx.exp(packed_scores - max_scores)
+    current_exp = mx.exp(current_scores - max_scores)
+    denom = mx.sum(packed_exp, axis=1, keepdims=True) + current_exp
+    packed_weights = packed_exp / denom
+    current_weights = current_exp / denom
+    packed_out = accumulate_packed_values_batched(
+        packed_weights,
+        v_codes,
+        centroids_v,
+        bit_width=bit_width,
+        head_dim=head_dim,
+    )
+    return packed_out + current_values.astype(mx.float32) * current_weights
+
+
 def decode_packed_attention(
     query: mx.array,
     k_codes: mx.array,

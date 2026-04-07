@@ -4,6 +4,22 @@
 
 The project is built around one core idea: KV-cache quantization only helps if decode attention operates directly on packed cached values instead of expanding them back into dense FP16 buffers. `torque-mlx` stores keys and values as packed quantized codes in a rotated basis and targets fused packed-code decode kernels for long-context inference.
 
+## Current Status
+
+The repo now demonstrates three things on real Qwen3.5 snapshots:
+
+- converted Qwen artifacts can be loaded and evaluated end-to-end
+- the packed torque KV path cuts converted-layer KV bytes by about `75%` at `4` bits
+- on `Qwen3.5-2B`, the current MLX runtime is near source-speed parity on fixed-length generation while keeping that KV reduction
+
+The most recent real `Qwen3.5-2B` MLX generation comparison in this repo, using the same `972`-token prompt and `64` generated tokens, came out to:
+
+- source: about `15.15 tok/s`
+- torque: about `14.55 tok/s`
+- converted-layer KV estimate: `12.73 MB` FP16 vs `3.18 MB` packed
+
+The most important current limitation is architectural rather than purely torque-specific: on Qwen3.5, the hybrid linear-attention layers still dominate end-to-end runtime. The converted full-attention layers are no longer the only meaningful bottleneck.
+
 ## What It Does Today
 
 The repo currently provides:
@@ -196,6 +212,17 @@ torque-mlx benchmark qwen-generate \
   --profile-runtime
 ```
 
+Compare the end-to-end MLX generation path against the matching synthetic KV decode hot path:
+
+```bash
+torque-mlx benchmark qwen-runtime-compare \
+  --model-dir ./artifacts/qwen3.5-2b-torque-delta \
+  --prompt "hello" \
+  --max-tokens 128 \
+  --prefill-step-size 128 \
+  --ignore-eos
+```
+
 The current Qwen converter:
 
 - reads a local Hugging Face-style `safetensors` snapshot
@@ -231,7 +258,8 @@ The experimental Qwen MLX generation benchmark:
 - loads local `qwen3_5` snapshots through a repo-local MLX adapter that normalizes them onto the `qwen3_next` text runtime
 - can load both merged converted snapshots and `delta_npz` artifacts
 - can optionally synchronize and report converted-layer dense prefill, prompt append, decode append, aggregate append, and torque decode timings via `--profile-runtime`
-- also breaks torque decode into packed score, softmax/merge, packed value accumulation, and dense-tail work when profiling is enabled
+- also breaks profiling into converted full-attention layer time, linear-layer time, and optional passthrough-attention time
+- further breaks torque decode into packed score, softmax/merge, packed value accumulation, and dense-tail work when profiling is enabled
 - uses dense cache prefill for hybrid Qwen3.5 prompt chunks, then routes converted `full_attention` decode through `TorqueKVCacheMLX`
 - buffers single-token decode appends through a small dense tail before flushing them into packed storage
 - can override that tail size through `--decode-tail-capacity`; by default the runtime now chooses it automatically from the Qwen text hidden size (`8` for smaller models like `0.8B`, `0` for `2B`-class models)
@@ -239,6 +267,14 @@ The experimental Qwen MLX generation benchmark:
 - supports fixed-length decode benchmarking with `--ignore-eos`, so source-vs-torque runs can compare the same number of generated tokens
 - is the first end-to-end MLX runtime path for converted Qwen artifacts in this repo
 - should still be treated as experimental until longer prompts and larger models are benchmarked systematically
+
+The Qwen runtime comparison benchmark:
+
+- runs `qwen-generate` first on a converted torque artifact
+- reuses the observed prompt token count and generated token count to run the synthetic `qwen-decode` hot-path benchmark on matching geometry
+- reports the gap between `hot_path_tokens_per_sec` and end-to-end `generation_tokens_per_sec`
+- nests both the generation result and the synthetic decode result so the remaining runtime overhead is explicit
+- now makes it clear whether the remaining gap is mostly inside converted torque layers or in the rest of the model/runtime
 
 The Qwen decode benchmark:
 
@@ -291,6 +327,7 @@ Not in scope yet:
 - [docs/cli.md](./docs/cli.md): command reference
 - [docs/contracts/model-artifact.md](./docs/contracts/model-artifact.md): generic artifact contract
 - [docs/families/qwen.md](./docs/families/qwen.md): curated Qwen workflow
+- [docs/runtime-status.md](./docs/runtime-status.md): current real-model runtime status and bottlenecks
 - [docs/model-support.md](./docs/model-support.md): support matrix and limits
 - [docs/architecture/runtime-boundary.md](./docs/architecture/runtime-boundary.md): Python vs compiled hot-path boundary
 - [PRD.md](./PRD.md): product requirements

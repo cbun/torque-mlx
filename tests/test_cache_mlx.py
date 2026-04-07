@@ -162,7 +162,8 @@ def test_mlx_cache_grouped_decode_matches_reference_with_dense_tail_flush() -> N
     np.testing.assert_allclose(actual, expected, atol=3e-4, rtol=3e-4)
 
 
-def test_mlx_cache_decode_with_current_matches_append_then_decode() -> None:
+@pytest.mark.parametrize("decode_tail_capacity", [0, 2])
+def test_mlx_cache_decode_with_current_matches_append_then_decode(decode_tail_capacity: int) -> None:
     pytest.importorskip("mlx.core")
     from torque_mlx.mlx_ops import metal_available
 
@@ -176,14 +177,14 @@ def test_mlx_cache_decode_with_current_matches_append_then_decode() -> None:
         key_codebook=_uniform_codebook(4),
         value_codebook=_uniform_codebook(4),
         initial_capacity=8,
-        decode_tail_capacity=2,
+        decode_tail_capacity=decode_tail_capacity,
     )
     cache_append_first = TorqueKVCacheMLX(
         config=config,
         key_codebook=_uniform_codebook(4),
         value_codebook=_uniform_codebook(4),
         initial_capacity=8,
-        decode_tail_capacity=2,
+        decode_tail_capacity=decode_tail_capacity,
     )
 
     for _ in range(4):
